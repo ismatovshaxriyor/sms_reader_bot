@@ -1,12 +1,12 @@
-"""Gmail API tinglovchisi: RingCentral SMS-bildirishnoma xatlarini o'qiydi.
+"""Gmail API tinglovchisi: RingCentral SMS / ovozli xabar bildirishnomalarini o'qiydi.
 
-RingCentral kelgan SMS'larni `service@ringcentral.com` manzilidan Gmail'ga yuboradi.
-Bu modul Gmail API orqali pochta qutisini muntazam tekshiradi, yangi (o'qilmagan)
-xatlarni parse qiladi, kerakli ma'lumotlarni ajratadi va Telegram'ga uzatish uchun
-on_sms'ga beradi.
+RingCentral xatlari (to'g'ridan-to'g'ri yoki forward qilingan) Gmail'ga keladi.
+Bu modul Gmail API orqali pochta qutisini muntazam tekshiradi, har bir xatni parse
+qilib, kerakli ma'lumotlarni (matn, vaqt, raqam) va biriktirmalarni (rasm / audio /
+hujjat) ajratadi va Telegram'ga uzatish uchun on_sms'ga beradi.
 
-Gmail API mijozi bloklovchi (sync) bo'lgani uchun barcha tarmoq amallari
-asyncio.to_thread orqali alohida ipda bajariladi.
+Gmail API mijozi bloklovchi (sync) bo'lgani uchun tarmoq amallari asyncio.to_thread
+orqali alohida ipda bajariladi.
 """
 
 import asyncio
@@ -30,7 +30,7 @@ OnSms = Callable[[dict], Awaitable[None]]
 OnAuthNeeded = Callable[[str], Awaitable[None]]
 
 
-# ===== Yordamchi parse funksiyalari =====
+# ===== Matn ajratish yordamchilari =====
 
 def _decode(value: str | None) -> str:
     if not value:
@@ -53,12 +53,11 @@ def _decode_payload(part: Message) -> str:
 
 
 def _html_to_text(html: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")
-    return soup.get_text(" ")
+    return BeautifulSoup(html, "html.parser").get_text(" ")
 
 
 def _get_text(msg: Message) -> str:
-    """Xatdan matnni oladi: avval text/plain, bo'lmasa HTML'dan."""
+    """Xatdan matnni oladi: avval text/plain (yulduzchali format), bo'lmasa HTML."""
     plain = None
     html = None
     if msg.is_multipart():
@@ -84,129 +83,123 @@ def _get_text(msg: Message) -> str:
     return ""
 
 
-# "New Text Message from (929) 454-5969 on 06/26/2026 9:58 AM"
+# ===== Parse =====
+
+# Subject: "New Text Message from (931) 272-7090 on 06/26/2026 9:18 AM"
+#          "New Voice Message from Update 4 - REYNA (956) 529-6576 on ... AM"
 _SUBJECT_RE = re.compile(
-    r"(?:new\s+)?text\s+message\s+from\s+(?P<from>.+?)\s+on\s+(?P<on>.+)$",
+    r"(?P<kind>text|voice|voicemail|fax|mms)\s+message\s+from\s+"
+    r"(?P<from>.+?)\s+on\s+(?P<on>.+?)\s*$",
     re.IGNORECASE,
 )
 
-# Maydon yorliqlari (From/To/Received/Message) joylashuvini topish uchun
-_LABEL_RE = re.compile(r"\b(From|To|Received|Sent|Date|Message)\s*:", re.IGNORECASE)
+# RingCentral matnida maydonlar yulduzcha bilan: "*From:*", "*Message:*", ...
+# (forward konvertidagi oddiy "Date:/To:/Subject:" bilan adashmaslik uchun)
+_AST_LABEL_RE = re.compile(r"\*\s*([A-Za-z][A-Za-z ]*?)\s*:\s*\*")
 
-# Xat oxiridagi keraksiz matnlar (SMS matnidan keyin keladi)
+# SMS/preview matnidan keyingi keraksiz qism
 _BOILERPLATE_RE = re.compile(
     r"\s*(?:To reply using"
+    r"|To listen to this message"
+    r"|open the attachment"
     r"|Thank you for using RingCentral"
     r"|Hello AI Receptionist"
     r"|AIR turns"
     r"|Learn more"
     r"|This (?:message|email) was sent"
-    r"|Reply\s+Forward)",
+    r"|-{3,})",
     re.IGNORECASE,
 )
 
-# Yorliq nomlarini ichki kalitga moslash
-_LABEL_MAP = {
-    "from": "from",
-    "to": "to",
-    "received": "received",
-    "sent": "received",
-    "date": "received",
-    "message": "message",
-}
 
-
-def is_sms_notification(subject: str) -> bool:
-    """Mavzuga qarab xat SMS bildirishnomasi ekanini aniqlaydi."""
-    s = (subject or "").lower()
-    return ("text message" in s) or bool(_SUBJECT_RE.search(subject or ""))
-
-
-def _parse_fields(text: str) -> dict[str, str]:
-    """Matndan From/To/Received/Message maydonlarini mustaqil ajratadi.
-
-    Yorliqlar joylashuvini topib, qiymatlarni ketma-ket yorliqlar orasidan oladi —
-    tartib yoki ba'zi maydonlar yo'qligidan qat'i nazar ishlaydi.
-    """
+def _parse_ast_fields(text: str) -> dict[str, str]:
+    """\"*Label:* value\" ko'rinishidagi maydonlarni ajratadi."""
     fields: dict[str, str] = {}
-    matches = list(_LABEL_RE.finditer(text))
+    matches = list(_AST_LABEL_RE.finditer(text))
     for i, mt in enumerate(matches):
-        key = _LABEL_MAP.get(mt.group(1).lower())
-        if not key:
-            continue
+        label = mt.group(1).strip().lower()
         start = mt.end()
         end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        value = text[start:end].strip(" \t:-")
-        value = _BOILERPLATE_RE.split(value, maxsplit=1)[0].strip(" \t:-")
-        # "Message" so'zi kirish matnida ham uchraydi ("...new text message:"),
-        # shuning uchun asl maydon — oxirgi moslik. Qolganlari uchun birinchisi.
-        if key == "message":
-            fields[key] = value
-        else:
-            fields.setdefault(key, value)
+        value = text[start:end].strip()
+        value = _BOILERPLATE_RE.split(value, maxsplit=1)[0].strip()
+        fields.setdefault(label, value)
     return fields
 
 
 def parse_message(raw: bytes) -> dict:
-    """Xom (RFC822) xatni parse qilib, SMS maydonlarini qaytaradi."""
+    """Xom (RFC822) xatni parse qilib, xabar maydonlarini qaytaradi."""
     msg = email.message_from_bytes(raw)
     message_id = (msg.get("Message-ID") or "").strip()
     subject = _decode(msg.get("Subject"))
 
-    body_text = _get_text(msg)
-    norm = " ".join(body_text.split())  # barcha bo'shliqlarni bitta qatorga keltiramiz
-
-    fields = _parse_fields(norm)
-    from_number = fields.get("from", "")
-    to_name = fields.get("to", "")
-    received = fields.get("received", "")
-    text = fields.get("message", "")
-    if text:
-        text = _BOILERPLATE_RE.split(text, maxsplit=1)[0].strip()
-
-    # Subjectdan zaxira (eng ishonchli manba): "...from <raqam> on <sana>"
+    # Subject — eng ishonchli manba (kind + from + vaqt)
+    kind = None
+    subj_from = subj_time = ""
     sm = _SUBJECT_RE.search(subject)
     if sm:
-        if not from_number:
-            from_number = sm.group("from").strip()
-        if not received:
-            received = sm.group("on").strip()
+        k = sm.group("kind").lower()
+        kind = "voice" if k in ("voice", "voicemail") else ("fax" if k == "fax" else "sms")
+        subj_from = sm.group("from").strip()
+        subj_time = sm.group("on").strip()
+
+    body_text = _get_text(msg)
+    norm = " ".join(body_text.split())
+    fields = _parse_ast_fields(norm)
+
+    from_number = subj_from or fields.get("from", "")
+    to_name = fields.get("to", "")
+    received = subj_time or fields.get("received", "")
+    length = fields.get("length", "")
+
+    if kind == "voice":
+        text = fields.get("voicemail preview", "").strip().strip('"').strip()
+    else:
+        text = fields.get("message", "")
 
     return {
         "message_id": message_id,
+        "kind": kind or "sms",
         "from_number": from_number or "—",
         "to_name": to_name or "—",
         "time": received,
+        "length": length,
         "text": text,
         "subject": subject,
-        "is_sms": is_sms_notification(subject),
+        "is_ringcentral": kind is not None,
     }
 
 
-def extract_images(raw: bytes) -> list[tuple[str, bytes]]:
-    """Xatdan haqiqiy rasm biriktirmalarini ajratadi (inline logolar emas)."""
+def extract_attachments(raw: bytes) -> list[tuple[str, str, bytes]]:
+    """Haqiqiy biriktirmalarni (filename, content_type, bytes) ajratadi.
+
+    Inline logolarni (Content-ID'li, attachment bo'lmagan) o'tkazib yuboradi.
+    """
     msg = email.message_from_bytes(raw)
-    images: list[tuple[str, bytes]] = []
+    out: list[tuple[str, str, bytes]] = []
     for part in msg.walk():
+        if part.is_multipart():
+            continue
         ctype = (part.get_content_type() or "").lower()
-        if not ctype.startswith("image/"):
+        if ctype in ("text/plain", "text/html"):
             continue
         disp = str(part.get("Content-Disposition") or "").lower()
         filename = part.get_filename()
         cid = part.get("Content-ID")
-        # Inline (Content-ID'li) rasmlar — odatda logo/banner; o'tkazib yuboramiz
-        is_attachment = "attachment" in disp or bool(filename)
-        if not is_attachment or (cid and "attachment" not in disp):
-            continue
+        if "attachment" in disp:
+            pass
+        elif filename and not cid:
+            pass
+        else:
+            continue  # inline (logo/banner) — o'tkazib yuboramiz
         data = part.get_payload(decode=True)
         if not data:
             continue
-        images.append((filename or "image.jpg", data))
-    return images
+        out.append((filename or "file", ctype, data))
+    return out
 
 
 def _dump_debug_email(raw: bytes, subject: str) -> None:
-    """Parse bo'sh chiqqan SMS xatini keyinroq tahlil qilish uchun saqlaydi."""
+    """Parse bo'sh chiqqan xatni keyinroq tahlil qilish uchun saqlaydi."""
     try:
         os.makedirs("debug_emails", exist_ok=True)
         safe = re.sub(r"[^A-Za-z0-9]+", "_", subject or "no_subject")[:50]
@@ -221,12 +214,11 @@ def _dump_debug_email(raw: bytes, subject: str) -> None:
 # ===== Gmail API (bloklovchi) amallar =====
 
 def _fetch_new(service) -> list[tuple[str, bytes]]:
-    """service@ringcentral.com'dan kelgan o'qilmagan xatlarni (id, raw) qaytaradi."""
-    query = f"from:{config.RINGCENTRAL_SENDER} is:unread"
+    """GMAIL_QUERY bo'yicha xatlarni (id, raw) ro'yxatini qaytaradi."""
     resp = (
         service.users()
         .messages()
-        .list(userId="me", q=query, maxResults=25)
+        .list(userId="me", q=config.GMAIL_QUERY, maxResults=25)
         .execute()
     )
     results: list[tuple[str, bytes]] = []
@@ -277,7 +269,6 @@ async def run_gmail_listener(
             logger.error(
                 "Gmail listener xatosi: %s. %ss dan keyin qayta ulanish...", exc, backoff
             )
-            # Token muammosi bo'lsa, adminlarga bir marta avtorizatsiya so'rovini yuboramiz
             if on_auth_needed and not notified_auth:
                 token_ok = await asyncio.to_thread(gmail_auth.has_valid_token)
                 if not token_ok:
@@ -295,10 +286,8 @@ async def _poll_once(service, on_sms: OnSms) -> None:
     for mid, raw in items:
         parsed = parse_message(raw)
 
-        # 0) SMS bo'lmagan RingCentral xatlari (ovozli xabar, reklama, ...) — o'tkazamiz
-        if not parsed["is_sms"]:
-            logger.info("SMS emas, o'tkazib yuborildi: %s", parsed["subject"])
-            await asyncio.to_thread(_mark_read, service, mid)
+        # 0) RingCentral xabari bo'lmasa — tegmaymiz (o'qilmagan holatda qoldiramiz)
+        if not parsed["is_ringcentral"]:
             continue
 
         # 1) Skip ro'yxatidagi raqamlar
@@ -316,27 +305,29 @@ async def _poll_once(service, on_sms: OnSms) -> None:
             continue
         await db.mark_processed(mid)
 
-        images = extract_images(raw)
+        attachments = extract_attachments(raw)
 
-        # Matn ham, rasm ham topilmasa — keyinroq tahlil uchun xatni saqlab qo'yamiz
-        if not parsed["text"] and not images:
+        # Matn ham, biriktirma ham yo'q bo'lsa — keyinroq tahlil uchun saqlaymiz
+        if not parsed["text"] and not attachments:
             _dump_debug_email(raw, parsed["subject"])
 
         sms = {
+            "kind": parsed["kind"],
             "from_number": parsed["from_number"],
             "to_name": parsed["to_name"],
             "time": parsed["time"],
+            "length": parsed["length"],
             "text": parsed["text"],
-            "images": images,
+            "attachments": attachments,
         }
         logger.info(
-            "Yangi SMS (Gmail): %s → %s | matn=%d belgi, rasm=%d ta",
-            parsed["from_number"], parsed["to_name"], len(parsed["text"]), len(images),
+            "Yangi %s: %s → %s | matn=%d belgi, biriktirma=%d",
+            parsed["kind"], parsed["from_number"], parsed["to_name"],
+            len(parsed["text"]), len(attachments),
         )
         try:
             await on_sms(sms)
         except Exception as exc:
-            logger.error("SMS uzatishda xato: %s", exc)
+            logger.error("Uzatishda xato: %s", exc)
 
-        # 3) Xatni o'qilgan deb belgilaymiz (qayta ishlanmasligi uchun)
         await asyncio.to_thread(_mark_read, service, mid)

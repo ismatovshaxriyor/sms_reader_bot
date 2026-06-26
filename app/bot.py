@@ -361,20 +361,37 @@ def _groups_text(rows) -> str:
 
 
 def _format_sms(sms: dict) -> str:
+    kind = sms.get("kind") or "sms"
     from_number = sms.get("from_number") or "—"
     to_name = sms.get("to_name") or "—"
     time_str = sms.get("time") or ""
-    text = sms.get("text") or "(bo'sh xabar)"
+    length = sms.get("length") or ""
+    text = (sms.get("text") or "").strip()
+
+    if kind == "voice":
+        header = "🎙 <b>Yangi ovozli xabar</b>"
+    elif kind == "fax":
+        header = "📠 <b>Yangi faks</b>"
+    else:
+        header = "📩 <b>Yangi SMS</b>"
 
     lines = [
-        "📩 <b>Yangi SMS</b>",
+        header,
         f"👤 Kimdan: <code>{escape(str(from_number))}</code>",
         f"📥 Qabul qiluvchi: {escape(str(to_name))}",
     ]
     if time_str:
         lines.append(f"🕐 {escape(str(time_str))}")
+    if kind == "voice" and length:
+        lines.append(f"⏱ Davomiyligi: {escape(str(length))}")
+
     lines.append("──────────────")
-    lines.append(escape(str(text)))
+    if text:
+        if kind == "voice":
+            lines.append("🗣 <i>Transkripsiya:</i>")
+        lines.append(escape(str(text)))
+    else:
+        lines.append("<i>(matnsiz — biriktirma quyida)</i>")
     return "\n".join(lines)
 
 
@@ -405,14 +422,14 @@ async def forward_sms(sms: dict) -> int:
             + text
         )
 
-    images = sms.get("images") or []
+    attachments = sms.get("attachments") or []
 
     sent = 0
     for chat_id in chat_ids:
         try:
             await _bot.send_message(chat_id, text)
-            for fname, data in images:
-                await _send_image(chat_id, fname, data)
+            for fname, ctype, data in attachments:
+                await _send_attachment(chat_id, fname, ctype, data)
             sent += 1
         except Exception as exc:
             logger.error("Yuborib bo'lmadi (%s): %s", chat_id, exc)
@@ -422,11 +439,21 @@ async def forward_sms(sms: dict) -> int:
     return sent
 
 
-async def _send_image(chat_id: int, filename: str, data: bytes) -> None:
-    """Rasmni photo sifatida yuboradi; bo'lmasa hujjat (document) sifatida."""
+async def _send_attachment(chat_id: int, filename: str, ctype: str, data: bytes) -> None:
+    """Biriktirmani turiga qarab yuboradi: rasm/audio/video/hujjat."""
+    ctype = (ctype or "").lower()
     try:
-        await _bot.send_photo(chat_id, BufferedInputFile(data, filename=filename))
+        file = BufferedInputFile(data, filename=filename)
+        if ctype.startswith("image/"):
+            await _bot.send_photo(chat_id, file)
+        elif ctype.startswith("audio/"):
+            await _bot.send_audio(chat_id, file)
+        elif ctype.startswith("video/"):
+            await _bot.send_video(chat_id, file)
+        else:
+            await _bot.send_document(chat_id, file)
     except Exception:
+        # Har qanday holatda hujjat sifatida urinib ko'ramiz
         await _bot.send_document(chat_id, BufferedInputFile(data, filename=filename))
 
 

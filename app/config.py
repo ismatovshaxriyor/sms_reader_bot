@@ -70,5 +70,13 @@ SKIP_NUMBERS: set[str] = _parse_skip_numbers(
     os.environ.get("SKIP_NUMBERS") or "(833) 963-2500"
 )
 
+# Gmail qidiruv so'rovi. RingCentral bildirishnomalarini mavzu bo'yicha topadi —
+# to'g'ridan-to'g'ri kelgan ham, forward qilingan (Fwd:) ham mos keladi.
+GMAIL_QUERY: str = (
+    os.environ.get("GMAIL_QUERY")
+    or 'subject:("New Text Message" OR "New Voice Message" OR "New Voicemail" '
+    'OR "New Fax" OR "New MMS") is:unread'
+).strip()
+
 # ===== Ma'lumotlar bazasi =====
 DATABASE_PATH: str = (os.environ.get("DATABASE_PATH") or "bot.db").strip()
