@@ -6,6 +6,9 @@ client_secret*.json
 credentials.json
 token.json
 
+# Tahlil uchun saqlangan xom xatlar (maxfiy)
+debug_emails/
+
 # Ma'lumotlar bazasi
 *.db
 *.db-journal

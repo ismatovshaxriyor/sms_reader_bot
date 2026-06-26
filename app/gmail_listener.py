@@ -13,7 +13,9 @@ import asyncio
 import base64
 import email
 import logging
+import os
 import re
+import time
 from email.header import decode_header, make_header
 from email.message import Message
 from typing import Awaitable, Callable
@@ -82,16 +84,67 @@ def _get_text(msg: Message) -> str:
     return ""
 
 
-_FIELDS_RE = re.compile(
-    r"From\s*:\s*(?P<from>.+?)\s+"
-    r"To\s*:\s*(?P<to>.+?)\s+"
-    r"Received\s*:\s*(?P<received>.+?)\s+"
-    r"Message\s*:\s*(?P<message>.+?)"
-    r"(?:\s+To reply|\s+Thank you for using RingCentral|$)",
+# "New Text Message from (929) 454-5969 on 06/26/2026 9:58 AM"
+_SUBJECT_RE = re.compile(
+    r"(?:new\s+)?text\s+message\s+from\s+(?P<from>.+?)\s+on\s+(?P<on>.+)$",
     re.IGNORECASE,
 )
 
-_SUBJECT_RE = re.compile(r"from\s+(?P<from>.+?)\s+on\s+(?P<on>.+)$", re.IGNORECASE)
+# Maydon yorliqlari (From/To/Received/Message) joylashuvini topish uchun
+_LABEL_RE = re.compile(r"\b(From|To|Received|Sent|Date|Message)\s*:", re.IGNORECASE)
+
+# Xat oxiridagi keraksiz matnlar (SMS matnidan keyin keladi)
+_BOILERPLATE_RE = re.compile(
+    r"\s*(?:To reply using"
+    r"|Thank you for using RingCentral"
+    r"|Hello AI Receptionist"
+    r"|AIR turns"
+    r"|Learn more"
+    r"|This (?:message|email) was sent"
+    r"|Reply\s+Forward)",
+    re.IGNORECASE,
+)
+
+# Yorliq nomlarini ichki kalitga moslash
+_LABEL_MAP = {
+    "from": "from",
+    "to": "to",
+    "received": "received",
+    "sent": "received",
+    "date": "received",
+    "message": "message",
+}
+
+
+def is_sms_notification(subject: str) -> bool:
+    """Mavzuga qarab xat SMS bildirishnomasi ekanini aniqlaydi."""
+    s = (subject or "").lower()
+    return ("text message" in s) or bool(_SUBJECT_RE.search(subject or ""))
+
+
+def _parse_fields(text: str) -> dict[str, str]:
+    """Matndan From/To/Received/Message maydonlarini mustaqil ajratadi.
+
+    Yorliqlar joylashuvini topib, qiymatlarni ketma-ket yorliqlar orasidan oladi —
+    tartib yoki ba'zi maydonlar yo'qligidan qat'i nazar ishlaydi.
+    """
+    fields: dict[str, str] = {}
+    matches = list(_LABEL_RE.finditer(text))
+    for i, mt in enumerate(matches):
+        key = _LABEL_MAP.get(mt.group(1).lower())
+        if not key:
+            continue
+        start = mt.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        value = text[start:end].strip(" \t:-")
+        value = _BOILERPLATE_RE.split(value, maxsplit=1)[0].strip(" \t:-")
+        # "Message" so'zi kirish matnida ham uchraydi ("...new text message:"),
+        # shuning uchun asl maydon — oxirgi moslik. Qolganlari uchun birinchisi.
+        if key == "message":
+            fields[key] = value
+        else:
+            fields.setdefault(key, value)
+    return fields
 
 
 def parse_message(raw: bytes) -> dict:
@@ -103,22 +156,21 @@ def parse_message(raw: bytes) -> dict:
     body_text = _get_text(msg)
     norm = " ".join(body_text.split())  # barcha bo'shliqlarni bitta qatorga keltiramiz
 
-    from_number = to_name = received = text = ""
-    m = _FIELDS_RE.search(norm)
-    if m:
-        from_number = m.group("from").strip()
-        to_name = m.group("to").strip()
-        received = m.group("received").strip()
-        text = m.group("message").strip()
-    else:
-        logger.warning("Xat parse qilinmadi (mavzu: %s)", subject)
+    fields = _parse_fields(norm)
+    from_number = fields.get("from", "")
+    to_name = fields.get("to", "")
+    received = fields.get("received", "")
+    text = fields.get("message", "")
+    if text:
+        text = _BOILERPLATE_RE.split(text, maxsplit=1)[0].strip()
 
-    # Subjectdan zaxira ma'lumot ("New Text Message from <raqam> on <sana>")
-    if not from_number or not received:
-        sm = _SUBJECT_RE.search(subject)
-        if sm:
-            from_number = from_number or sm.group("from").strip()
-            received = received or sm.group("on").strip()
+    # Subjectdan zaxira (eng ishonchli manba): "...from <raqam> on <sana>"
+    sm = _SUBJECT_RE.search(subject)
+    if sm:
+        if not from_number:
+            from_number = sm.group("from").strip()
+        if not received:
+            received = sm.group("on").strip()
 
     return {
         "message_id": message_id,
@@ -127,7 +179,43 @@ def parse_message(raw: bytes) -> dict:
         "time": received,
         "text": text,
         "subject": subject,
+        "is_sms": is_sms_notification(subject),
     }
+
+
+def extract_images(raw: bytes) -> list[tuple[str, bytes]]:
+    """Xatdan haqiqiy rasm biriktirmalarini ajratadi (inline logolar emas)."""
+    msg = email.message_from_bytes(raw)
+    images: list[tuple[str, bytes]] = []
+    for part in msg.walk():
+        ctype = (part.get_content_type() or "").lower()
+        if not ctype.startswith("image/"):
+            continue
+        disp = str(part.get("Content-Disposition") or "").lower()
+        filename = part.get_filename()
+        cid = part.get("Content-ID")
+        # Inline (Content-ID'li) rasmlar — odatda logo/banner; o'tkazib yuboramiz
+        is_attachment = "attachment" in disp or bool(filename)
+        if not is_attachment or (cid and "attachment" not in disp):
+            continue
+        data = part.get_payload(decode=True)
+        if not data:
+            continue
+        images.append((filename or "image.jpg", data))
+    return images
+
+
+def _dump_debug_email(raw: bytes, subject: str) -> None:
+    """Parse bo'sh chiqqan SMS xatini keyinroq tahlil qilish uchun saqlaydi."""
+    try:
+        os.makedirs("debug_emails", exist_ok=True)
+        safe = re.sub(r"[^A-Za-z0-9]+", "_", subject or "no_subject")[:50]
+        path = os.path.join("debug_emails", f"{safe}_{int(time.time())}.eml")
+        with open(path, "wb") as f:
+            f.write(raw)
+        logger.warning("Parse bo'sh — xat tahlil uchun saqlandi: %s", path)
+    except Exception as exc:
+        logger.error("debug email saqlashda xato: %s", exc)
 
 
 # ===== Gmail API (bloklovchi) amallar =====
@@ -207,6 +295,12 @@ async def _poll_once(service, on_sms: OnSms) -> None:
     for mid, raw in items:
         parsed = parse_message(raw)
 
+        # 0) SMS bo'lmagan RingCentral xatlari (ovozli xabar, reklama, ...) — o'tkazamiz
+        if not parsed["is_sms"]:
+            logger.info("SMS emas, o'tkazib yuborildi: %s", parsed["subject"])
+            await asyncio.to_thread(_mark_read, service, mid)
+            continue
+
         # 1) Skip ro'yxatidagi raqamlar
         if (
             config.SKIP_NUMBERS
@@ -222,13 +316,23 @@ async def _poll_once(service, on_sms: OnSms) -> None:
             continue
         await db.mark_processed(mid)
 
+        images = extract_images(raw)
+
+        # Matn ham, rasm ham topilmasa — keyinroq tahlil uchun xatni saqlab qo'yamiz
+        if not parsed["text"] and not images:
+            _dump_debug_email(raw, parsed["subject"])
+
         sms = {
             "from_number": parsed["from_number"],
             "to_name": parsed["to_name"],
             "time": parsed["time"],
             "text": parsed["text"],
+            "images": images,
         }
-        logger.info("Yangi SMS (Gmail): %s → %s", parsed["from_number"], parsed["to_name"])
+        logger.info(
+            "Yangi SMS (Gmail): %s → %s | matn=%d belgi, rasm=%d ta",
+            parsed["from_number"], parsed["to_name"], len(parsed["text"]), len(images),
+        )
         try:
             await on_sms(sms)
         except Exception as exc:

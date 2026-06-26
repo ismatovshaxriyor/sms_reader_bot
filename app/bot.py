@@ -16,6 +16,7 @@ from aiogram.enums import ChatMemberStatus, ChatType, ParseMode
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import BaseFilter, CommandStart
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     ChatMemberUpdated,
     InlineKeyboardMarkup,
@@ -404,10 +405,14 @@ async def forward_sms(sms: dict) -> int:
             + text
         )
 
+    images = sms.get("images") or []
+
     sent = 0
     for chat_id in chat_ids:
         try:
             await _bot.send_message(chat_id, text)
+            for fname, data in images:
+                await _send_image(chat_id, fname, data)
             sent += 1
         except Exception as exc:
             logger.error("Yuborib bo'lmadi (%s): %s", chat_id, exc)
@@ -415,6 +420,14 @@ async def forward_sms(sms: dict) -> int:
             if not fallback:
                 await db.set_group_status(chat_id, "removed")
     return sent
+
+
+async def _send_image(chat_id: int, filename: str, data: bytes) -> None:
+    """Rasmni photo sifatida yuboradi; bo'lmasa hujjat (document) sifatida."""
+    try:
+        await _bot.send_photo(chat_id, BufferedInputFile(data, filename=filename))
+    except Exception:
+        await _bot.send_document(chat_id, BufferedInputFile(data, filename=filename))
 
 
 def create_bot() -> tuple[Bot, Dispatcher]:
