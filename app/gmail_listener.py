@@ -174,6 +174,28 @@ def parse_message(raw: bytes) -> dict:
     else:
         text = fields.get("message", "")
 
+    # Fallback: Agar "Message:" degan label bo'lmasa, butun email tekstidan xabarni ajratib olamiz
+    if not text and kind != "voice":
+        lines = body_text.split('\n')
+        start_idx = -1
+        end_idx = len(lines)
+        
+        for i, line in enumerate(lines):
+            if re.search(r'\bReceived\s*:', line, re.IGNORECASE):
+                start_idx = i + 1
+            elif start_idx != -1 and _BOILERPLATE_RE.search(line):
+                end_idx = i
+                break
+                
+        if start_idx != -1 and start_idx < end_idx:
+            extracted_lines = []
+            for line in lines[start_idx:end_idx]:
+                if not re.search(r'^\*?Attachment:\*?', line.strip(), re.IGNORECASE):
+                    extracted_lines.append(line)
+            fallback_text = "\n".join(extracted_lines).strip()
+            if fallback_text:
+                text = fallback_text
+
     return {
         "message_id": message_id,
         "kind": kind or "sms",
@@ -322,6 +344,12 @@ async def _poll_once(service, on_sms: OnSms) -> None:
             await asyncio.to_thread(_mark_read, service, mid)
             continue
         await db.mark_processed(mid)
+
+        # 3) Skip voicemails with "Unavailable" preview
+        if parsed["kind"] == "voice" and parsed["text"].lower() in ("unavailable", ""):
+            logger.info("Skipped (voicemail unavailable or empty): %s", parsed["from_number"])
+            await asyncio.to_thread(_mark_read, service, mid)
+            continue
 
         attachments = extract_attachments(raw)
 

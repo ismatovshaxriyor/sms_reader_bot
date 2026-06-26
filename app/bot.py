@@ -419,6 +419,7 @@ def _format_sms(sms: dict) -> str:
     time_str = sms.get("time") or ""
     length = sms.get("length") or ""
     text = (sms.get("text") or "").strip()
+    attachments = sms.get("attachments") or []
 
     if kind == "voice":
         header = "🎙 <b>New voice message</b>"
@@ -442,8 +443,10 @@ def _format_sms(sms: dict) -> str:
         if kind == "voice":
             lines.append("🗣 <i>Transcription:</i>")
         lines.append(escape(str(text)))
-    else:
+    elif attachments:
         lines.append("<i>(no text — attachment below)</i>")
+    else:
+        lines.append("<i>(empty message)</i>")
     return "\n".join(lines)
 
 
