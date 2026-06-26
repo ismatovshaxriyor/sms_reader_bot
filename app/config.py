@@ -54,11 +54,8 @@ def _parse_skip_numbers(raw: str) -> set[str]:
 TELEGRAM_BOT_TOKEN: str = _get_required("TELEGRAM_BOT_TOKEN")
 ADMIN_IDS: set[int] = _parse_admin_ids(os.environ.get("ADMIN_IDS", ""))
 
-# ===== Gmail (IMAP) =====
-GMAIL_ADDRESS: str = _get_required("GMAIL_ADDRESS")
-GMAIL_APP_PASSWORD: str = _get_required("GMAIL_APP_PASSWORD").replace(" ", "")
-IMAP_HOST: str = (os.environ.get("IMAP_HOST") or "imap.gmail.com").strip()
-IMAP_PORT: int = int(os.environ.get("IMAP_PORT") or "993")
+# ===== Gmail (API / OAuth) =====
+# OAuth credential va token fayllari app/gmail_auth.py da boshqariladi.
 
 # RingCentral SMS-bildirishnomalari shu manzildan keladi
 RINGCENTRAL_SENDER: str = (

@@ -1,17 +1,17 @@
 # RingCentral SMS (Gmail) → Telegram Bot
 
-RingCentral SMS-bildirishnomalarini **Gmail orqali** o'qib, tasdiqlangan
+RingCentral SMS-bildirishnomalarini **Gmail API** orqali o'qib, tasdiqlangan
 Telegram **guruh(lar)iga** uzatadigan bot.
 
 RingCentral kelgan SMS'larni `service@ringcentral.com` manzilidan Gmail'ga yuboradi.
-Bot pochta qutisini IMAP orqali muntazam tekshiradi, xatdan ma'lumotlarni ajratadi
+Bot pochta qutisini Gmail API orqali muntazam tekshiradi, xatdan ma'lumotlarni ajratadi
 va Telegram'ga uzatadi.
 
-- 📧 Gmail **IMAP** orqali ishlaydi — ochiq HTTPS server yoki RingCentral API kerak emas.
+- 📧 Gmail **API (OAuth2)** orqali ishlaydi — ochiq HTTPS server yoki RingCentral API kerak emas.
 - 🗄 Maqsad guruhlar **SQLite** bazasida saqlanadi va bot orqali boshqariladi.
 - 🔐 Bot bilan muloqot faqat **adminlar** uchun; barcha amallar **tugmalar** orqali.
 - 🚫 Belgilangan raqamlardan (masalan `(833) 963-2500`) kelgan SMS'lar o'tkazib yuboriladi.
-- 🔁 Aloqa uzilsa avtomatik qayta ulanadi; takror xatlar (Message-ID) filtrlanadi.
+- 🔁 Xato bo'lsa avtomatik qayta ulanadi; takror xatlar (xabar ID) filtrlanadi.
 - 🛟 Tasdiqlangan guruh bo'lmasa, SMS adminning shaxsiy chatiga yuboriladi (yo'qolmaydi).
 
 ---
@@ -37,28 +37,35 @@ cp .env.example .env
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | @BotFather'dan olingan token |
 | `ADMIN_IDS` | Admin Telegram ID'lari, vergul bilan (masalan `12345,67890`) |
-| `GMAIL_ADDRESS` | RingCentral xatlari keladigan Gmail manzili |
-| `GMAIL_APP_PASSWORD` | Gmail **App Password** (16 belgi) — oddiy parol emas |
+| `GMAIL_CREDENTIALS_FILE` | OAuth client fayli yo'li (bo'sh — `client_secret*.json` avto-topiladi) |
+| `GMAIL_TOKEN_FILE` | OAuth token fayli (standart `token.json`) |
 | `RINGCENTRAL_SENDER` | Jo'natuvchi manzil (standart `service@ringcentral.com`) |
 | `POLL_INTERVAL` | Pochtani necha soniyada tekshirish (standart `15`) |
 | `SKIP_NUMBERS` | O'tkazib yuboriladigan raqamlar, vergul bilan |
-| `IMAP_HOST` / `IMAP_PORT` | Gmail uchun `imap.gmail.com` / `993` |
 | `DATABASE_PATH` | (ixtiyoriy) baza fayli, standart `bot.db` |
 
 ### Telegram tomoni
 1. [@BotFather](https://t.me/BotFather)'da `/newbot` → tokenni oling.
 2. Botga shaxsiy chatda `/start` yuboring → bot sizning ID'ingizni ko'rsatadi → `ADMIN_IDS`ga yozing.
 
-### Gmail tomoni (App Password)
-1. Google akkauntda **2-bosqichli tasdiqni (2FA)** yoqing.
-2. [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords) → yangi
-   **App Password** yarating (16 belgi).
-3. Uni `GMAIL_APP_PASSWORD`ga yozing (bo'shliqlarsiz).
-4. Gmail'da **IMAP yoqilgan** bo'lishi kerak (Settings → Forwarding and POP/IMAP → Enable IMAP;
-   odatda standart yoqilgan).
+### Gmail tomoni (API / OAuth)
+1. [Google Cloud Console](https://console.cloud.google.com/) → loyiha yarating.
+2. **APIs & Services → Library → Gmail API → Enable**.
+3. **OAuth consent screen** sozlang; o'zingizni **Test user** sifatida qo'shing.
+4. **Credentials → Create Credentials → OAuth client ID → Application type: Desktop app**.
+5. `client_secret_*.json` faylini yuklab, loyiha papkasiga qo'ying
+   (yoki `GMAIL_CREDENTIALS_FILE`da yo'lini ko'rsating).
+6. **Bir martalik avtorizatsiya** (brauzer ochiladi):
+   ```bash
+   python -m app.authorize
+   ```
+   Bu `token.json` faylini yaratadi. Serverda bu fayl lokal mashinada yaratilib,
+   serverga ko'chiriladi (pastga qarang).
 
 > RingCentral tomonida: SMS → email bildirishnoma (notification) yoqilgan bo'lishi va xatlar
 > ushbu Gmail manziliga kelishi kerak.
+
+> ⚠️ `client_secret_*.json` va `token.json` — **maxfiy** fayllar, git'ga tushmaydi.
 
 ## 3. Ishga tushirish
 
@@ -70,7 +77,7 @@ Loglar quyidagicha bo'lishi kerak:
 ```
 Ma'lumotlar bazasi tayyor: bot.db
 Telegram bot ishga tushdi: @your_bot
-Gmail IMAP'ga ulanildi (you@gmail.com). Har 15s da tekshiriladi.
+Gmail API'ga ulanildi. Har 15s da tekshiriladi.
 ```
 
 ## 4. Foydalanish (tugmalar orqali)
@@ -100,17 +107,17 @@ Botda **faqat bitta komanda** — `/start`. Qolgan barcha amallar inline **tugma
 
 ## Qanday ishlaydi
 
-1. `gmail_listener` har `POLL_INTERVAL` soniyada Gmail'ni IMAP orqali tekshiradi:
-   `service@ringcentral.com`'dan kelgan **o'qilmagan** xatlarni qidiradi.
+1. `gmail_listener` har `POLL_INTERVAL` soniyada Gmail API orqali tekshiradi:
+   `from:service@ringcentral.com is:unread` so'rovi bilan **o'qilmagan** xatlarni qidiradi.
 2. Har bir xat parse qilinadi: **From** (raqam), **To** (qabul qiluvchi), **Received** (vaqt),
    **Message** (SMS matni). Subject ham zaxira sifatida ishlatiladi.
 3. `SKIP_NUMBERS`dagi raqam bo'lsa — o'tkazib yuboriladi.
-4. `Message-ID` bo'yicha takror tekshiriladi (dublikat yuborilmaydi).
+4. Gmail xabar ID'si bo'yicha takror tekshiriladi (dublikat yuborilmaydi).
 5. Matn formatlanib, DB'dagi `active` guruhlarga (yoki admin chatiga) uzatiladi.
-6. Xat «o'qilgan» deb belgilanadi.
+6. Xat «o'qilgan» (UNREAD olib tashlanadi) deb belgilanadi.
 
-> Eslatma: bot xatlarni «o'qilmagan» (UNSEEN) holati bo'yicha topadi. Agar xatni Gmail'da
-> bot'dan oldin o'zingiz ochib qo'ysangiz, u o'qilgan bo'lib qoladi va uzatilmasligi mumkin.
+> Eslatma: bot xatlarni «o'qilmagan» holati bo'yicha topadi. Agar xatni Gmail'da bot'dan
+> oldin o'zingiz ochib qo'ysangiz, u o'qilgan bo'lib qoladi va uzatilmasligi mumkin.
 
 ## Loyiha tuzilishi
 
@@ -120,11 +127,16 @@ app/
 ├── config.py          # .env yuklash va validatsiya
 ├── db.py              # SQLite: guruhlar + dedup
 ├── bot.py             # aiogram bot, IsAdmin, tugmalar, forward_sms
-└── gmail_listener.py  # IMAP: xat o'qish, parse, skip, dedup, reconnect
+├── gmail_auth.py      # Gmail API OAuth (credential/token)
+├── authorize.py       # bir martalik OAuth avtorizatsiya skripti
+└── gmail_listener.py  # Gmail API: xat o'qish, parse, skip, dedup, reconnect
 ```
 
 ## Eslatmalar
 
-- Uzoq ishlash uchun botni `systemd`, `pm2`, `supervisor` yoki Docker ostida ishlating.
+- Uzoq ishlash uchun botni `systemd`, `pm2`, `supervisor` yoki Docker ostida ishlating
+  (qarang: [DEPLOY.md](DEPLOY.md)).
 - Bir vaqtning o'zida **faqat bitta nusxa** ishlasin (Telegram `getUpdates` konflikti).
-- `bot.db` va `.env` `.gitignore`da — ularni git'ga qo'shmang.
+- `bot.db`, `.env`, `client_secret*.json`, `token.json` — `.gitignore`da, git'ga qo'shmang.
+- OAuth consent "Testing" rejimida bo'lsa, refresh token ~7 kunda eskirishi mumkin —
+  ilovani "In production" qiling yoki o'zingizni test user sifatida qo'shing.

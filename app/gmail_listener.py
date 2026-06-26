@@ -1,16 +1,17 @@
-"""Gmail (IMAP) tinglovchisi: RingCentral SMS-bildirishnoma xatlarini o'qiydi.
+"""Gmail API tinglovchisi: RingCentral SMS-bildirishnoma xatlarini o'qiydi.
 
-RingCentral SMS'larni `service@ringcentral.com` manzilidan Gmail'ga yuboradi.
-Bu modul pochta qutisini muntazam tekshirib, yangi xatlarni parse qiladi,
-kerakli ma'lumotlarni ajratadi va Telegram'ga uzatish uchun on_sms'ga beradi.
+RingCentral kelgan SMS'larni `service@ringcentral.com` manzilidan Gmail'ga yuboradi.
+Bu modul Gmail API orqali pochta qutisini muntazam tekshiradi, yangi (o'qilmagan)
+xatlarni parse qiladi, kerakli ma'lumotlarni ajratadi va Telegram'ga uzatish uchun
+on_sms'ga beradi.
 
-IMAP bloklovchi (sync) bo'lgani uchun barcha tarmoq amallari asyncio.to_thread
-orqali alohida ipda bajariladi.
+Gmail API mijozi bloklovchi (sync) bo'lgani uchun barcha tarmoq amallari
+asyncio.to_thread orqali alohida ipda bajariladi.
 """
 
 import asyncio
+import base64
 import email
-import imaplib
 import logging
 import re
 from email.header import decode_header, make_header
@@ -19,7 +20,7 @@ from typing import Awaitable, Callable
 
 from bs4 import BeautifulSoup
 
-from app import config, db
+from app import config, db, gmail_auth
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +94,7 @@ _SUBJECT_RE = re.compile(r"from\s+(?P<from>.+?)\s+on\s+(?P<on>.+)$", re.IGNORECA
 
 
 def parse_message(raw: bytes) -> dict:
-    """Xom xatni parse qilib, SMS maydonlarini qaytaradi."""
+    """Xom (RFC822) xatni parse qilib, SMS maydonlarini qaytaradi."""
     msg = email.message_from_bytes(raw)
     message_id = (msg.get("Message-ID") or "").strip()
     subject = _decode(msg.get("Subject"))
@@ -128,51 +129,51 @@ def parse_message(raw: bytes) -> dict:
     }
 
 
-# ===== IMAP (bloklovchi) amallar =====
+# ===== Gmail API (bloklovchi) amallar =====
 
-def _connect() -> imaplib.IMAP4_SSL:
-    imap = imaplib.IMAP4_SSL(config.IMAP_HOST, config.IMAP_PORT)
-    imap.login(config.GMAIL_ADDRESS, config.GMAIL_APP_PASSWORD)
-    imap.select("INBOX")
-    return imap
-
-
-def _fetch_new(imap: imaplib.IMAP4_SSL) -> list[tuple[bytes, bytes]]:
-    """service@ringcentral.com'dan kelgan o'qilmagan xatlarni (uid, raw) qaytaradi."""
-    criteria = f'(FROM "{config.RINGCENTRAL_SENDER}" UNSEEN)'
-    typ, data = imap.uid("search", None, criteria)
-    if typ != "OK" or not data or data[0] is None:
-        return []
-    results: list[tuple[bytes, bytes]] = []
-    for uid in data[0].split():
-        typ, msg_data = imap.uid("fetch", uid, "(RFC822)")
-        if typ != "OK" or not msg_data or msg_data[0] is None:
-            continue
-        results.append((uid, msg_data[0][1]))
+def _fetch_new(service) -> list[tuple[str, bytes]]:
+    """service@ringcentral.com'dan kelgan o'qilmagan xatlarni (id, raw) qaytaradi."""
+    query = f"from:{config.RINGCENTRAL_SENDER} is:unread"
+    resp = (
+        service.users()
+        .messages()
+        .list(userId="me", q=query, maxResults=25)
+        .execute()
+    )
+    results: list[tuple[str, bytes]] = []
+    for item in resp.get("messages", []):
+        mid = item["id"]
+        full = (
+            service.users()
+            .messages()
+            .get(userId="me", id=mid, format="raw")
+            .execute()
+        )
+        raw = base64.urlsafe_b64decode(full["raw"].encode("utf-8"))
+        results.append((mid, raw))
     return results
 
 
-def _mark_seen(imap: imaplib.IMAP4_SSL, uid: bytes) -> None:
-    imap.uid("store", uid, "+FLAGS", "(\\Seen)")
+def _mark_read(service, mid: str) -> None:
+    service.users().messages().modify(
+        userId="me", id=mid, body={"removeLabelIds": ["UNREAD"]}
+    ).execute()
 
 
 # ===== Asosiy tsikl =====
 
 async def run_gmail_listener(on_sms: OnSms) -> None:
-    """Doimiy ishlaydi: ulanadi, muntazam tekshiradi, uzilsa qayta ulanadi."""
+    """Doimiy ishlaydi: ulanadi, muntazam tekshiradi, xato bo'lsa qayta ulanadi."""
     backoff = 5
     while True:
-        imap: imaplib.IMAP4_SSL | None = None
         try:
-            imap = await asyncio.to_thread(_connect)
+            service = await asyncio.to_thread(gmail_auth.build_service)
             logger.info(
-                "Gmail IMAP'ga ulanildi (%s). Har %ss da tekshiriladi.",
-                config.GMAIL_ADDRESS,
-                config.POLL_INTERVAL,
+                "Gmail API'ga ulanildi. Har %ss da tekshiriladi.", config.POLL_INTERVAL
             )
             backoff = 5
             while True:
-                await _poll_once(imap, on_sms)
+                await _poll_once(service, on_sms)
                 await asyncio.sleep(config.POLL_INTERVAL)
         except asyncio.CancelledError:
             raise
@@ -182,32 +183,27 @@ async def run_gmail_listener(on_sms: OnSms) -> None:
             )
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
-        finally:
-            if imap is not None:
-                try:
-                    await asyncio.to_thread(imap.logout)
-                except Exception:
-                    pass
 
 
-async def _poll_once(imap: imaplib.IMAP4_SSL, on_sms: OnSms) -> None:
-    items = await asyncio.to_thread(_fetch_new, imap)
-    for uid, raw in items:
+async def _poll_once(service, on_sms: OnSms) -> None:
+    items = await asyncio.to_thread(_fetch_new, service)
+    for mid, raw in items:
         parsed = parse_message(raw)
 
         # 1) Skip ro'yxatidagi raqamlar
-        if config.SKIP_NUMBERS and config.normalize_number(parsed["from_number"]) in config.SKIP_NUMBERS:
+        if (
+            config.SKIP_NUMBERS
+            and config.normalize_number(parsed["from_number"]) in config.SKIP_NUMBERS
+        ):
             logger.info("O'tkazib yuborildi (skip raqam): %s", parsed["from_number"])
-            await asyncio.to_thread(_mark_seen, imap, uid)
+            await asyncio.to_thread(_mark_read, service, mid)
             continue
 
-        # 2) Dublikat (Message-ID bo'yicha)
-        msg_id = parsed["message_id"]
-        if msg_id and await db.is_processed(msg_id):
-            await asyncio.to_thread(_mark_seen, imap, uid)
+        # 2) Dublikat (Gmail xabar ID'si bo'yicha)
+        if await db.is_processed(mid):
+            await asyncio.to_thread(_mark_read, service, mid)
             continue
-        if msg_id:
-            await db.mark_processed(msg_id)
+        await db.mark_processed(mid)
 
         sms = {
             "from_number": parsed["from_number"],
@@ -215,11 +211,11 @@ async def _poll_once(imap: imaplib.IMAP4_SSL, on_sms: OnSms) -> None:
             "time": parsed["time"],
             "text": parsed["text"],
         }
-        logger.info("Yangi SMS (email): %s → %s", parsed["from_number"], parsed["to_name"])
+        logger.info("Yangi SMS (Gmail): %s → %s", parsed["from_number"], parsed["to_name"])
         try:
             await on_sms(sms)
         except Exception as exc:
             logger.error("SMS uzatishda xato: %s", exc)
 
         # 3) Xatni o'qilgan deb belgilaymiz (qayta ishlanmasligi uchun)
-        await asyncio.to_thread(_mark_seen, imap, uid)
+        await asyncio.to_thread(_mark_read, service, mid)

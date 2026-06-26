@@ -1,6 +1,11 @@
 # Maxfiy sozlamalar
 .env
 
+# Gmail API maxfiy fayllari (HECH QACHON commit qilinmasin!)
+client_secret*.json
+credentials.json
+token.json
+
 # Ma'lumotlar bazasi
 *.db
 *.db-journal

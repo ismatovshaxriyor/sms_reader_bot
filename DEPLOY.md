@@ -43,7 +43,7 @@ sudo -u botuser cp .env.example .env
 sudo -u botuser nano .env      # yoki vim
 ```
 
-To'ldiring: `TELEGRAM_BOT_TOKEN`, `ADMIN_IDS`, `GMAIL_ADDRESS`, `GMAIL_APP_PASSWORD`
+To'ldiring: `TELEGRAM_BOT_TOKEN`, `ADMIN_IDS`
 (va kerak bo'lsa `SKIP_NUMBERS`, `POLL_INTERVAL`).
 
 > `.env` faqat serverda turadi va git'ga tushmaydi. Ruxsatlarni cheklang:
@@ -51,13 +51,35 @@ To'ldiring: `TELEGRAM_BOT_TOKEN`, `ADMIN_IDS`, `GMAIL_ADDRESS`, `GMAIL_APP_PASSW
 > sudo chmod 600 /opt/sms_reader_bot/.env
 > ```
 
-Tekshirish (ixtiyoriy — qo'lda bir marta ishga tushirib ko'rish):
+## 5. Gmail OAuth fayllarini ko'chirish
+
+Server brauzersiz (headless) bo'lgani uchun OAuth avtorizatsiyani **lokal kompyuterda**
+bajaring, so'ng natijani serverga ko'chiring.
+
+Lokal kompyuterda (loyiha papkasida):
 ```bash
-sudo -u botuser venv/bin/python -m app.main
-# loglar chiqsa, Ctrl+C bilan to'xtating
+python -m app.authorize     # brauzer ochiladi -> token.json yaratiladi
 ```
 
-## 5. systemd xizmatini o'rnatish
+Hosil bo'lgan ikkita maxfiy faylni serverga ko'chiring:
+```bash
+scp client_secret_*.json token.json USER@SERVER:/opt/sms_reader_bot/
+```
+
+Serverda ruxsat va egalikni to'g'rilang:
+```bash
+sudo chown botuser:botuser /opt/sms_reader_bot/client_secret_*.json /opt/sms_reader_bot/token.json
+sudo chmod 600 /opt/sms_reader_bot/client_secret_*.json /opt/sms_reader_bot/token.json
+```
+
+Tekshirish (ixtiyoriy — qo'lda bir marta ishga tushirib ko'rish):
+```bash
+cd /opt/sms_reader_bot
+sudo -u botuser venv/bin/python -m app.main
+# "Gmail API'ga ulanildi" chiqsa, Ctrl+C bilan to'xtating
+```
+
+## 6. systemd xizmatini o'rnatish
 
 ```bash
 sudo cp /opt/sms_reader_bot/deploy/sms-reader-bot.service /etc/systemd/system/
@@ -75,7 +97,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now sms-reader-bot
 ```
 
-## 6. Holat va loglar
+## 7. Holat va loglar
 
 ```bash
 # Holat
@@ -91,10 +113,10 @@ sudo journalctl -u sms-reader-bot -n 100 --no-pager
 Muvaffaqiyatli ishga tushsa, loglarda:
 ```
 Telegram bot ishga tushdi: @...
-Gmail IMAP'ga ulanildi (...). Har 15s da tekshiriladi.
+Gmail API'ga ulanildi. Har 15s da tekshiriladi.
 ```
 
-## 7. Boshqaruv komandalar
+## 8. Boshqaruv komandalar
 
 ```bash
 sudo systemctl restart sms-reader-bot   # qayta ishga tushirish
@@ -103,7 +125,7 @@ sudo systemctl start sms-reader-bot     # ishga tushirish
 sudo systemctl disable sms-reader-bot   # avtomatik ishga tushishni o'chirish
 ```
 
-## 8. Yangilanish (kod o'zgarganda)
+## 9. Yangilanish (kod o'zgarganda)
 
 ```bash
 cd /opt/sms_reader_bot
@@ -117,4 +139,6 @@ sudo systemctl restart sms-reader-bot
 - Bir vaqtning o'zida **faqat bitta nusxa** ishlasin (Telegram `getUpdates` konflikti).
   Lokal kompyuteringizda test uchun ishlatib turgan bo'lsangiz, uni to'xtating.
 - Server vaqti (timezone) to'g'ri bo'lsin — loglar va vaqtlar uchun.
-- Gmail App Password ishlashi uchun akkauntda 2FA yoqilgan bo'lishi shart.
+- `token.json` muddati tugasa (masalan OAuth "Testing" rejimida ~7 kun), lokalda qayta
+  `python -m app.authorize` qilib, yangi `token.json`ni serverga ko'chiring.
+- `client_secret*.json` va `token.json` faqat serverda turadi — git'ga tushmaydi.
