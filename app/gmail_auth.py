@@ -10,6 +10,7 @@ import os
 from dotenv import load_dotenv
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 
 load_dotenv()
@@ -18,6 +19,11 @@ load_dotenv()
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 
 TOKEN_FILE = (os.environ.get("GMAIL_TOKEN_FILE") or "token.json").strip()
+
+# Brauzersiz (Telegram orqali) avtorizatsiya uchun loopback redirect.
+# Foydalanuvchi ruxsat bergach, brauzer http://localhost/?code=... ga o'tadi
+# (sahifa ochilmaydi) va kod o'sha manzildan olinadi.
+REDIRECT_URI = "http://localhost"
 
 
 def credentials_file() -> str:
@@ -62,3 +68,46 @@ def load_credentials() -> Credentials:
 def build_service():
     """Gmail API xizmat (service) obyektini qaytaradi."""
     return build("gmail", "v1", credentials=load_credentials(), cache_discovery=False)
+
+
+def has_valid_token() -> bool:
+    """token.json mavjud va yaroqli (yoki yangilab bo'ladigan) bo'lsa True."""
+    if not os.path.exists(TOKEN_FILE):
+        return False
+    try:
+        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+    except Exception:
+        return False
+    if creds.valid:
+        return True
+    if creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+            save_credentials(creds)
+            return True
+        except Exception:
+            return False
+    return False
+
+
+# ===== Telegram orqali OAuth (brauzersiz server uchun) =====
+
+def create_auth_flow() -> Flow:
+    """OAuth Flow yaratadi (loopback redirect bilan)."""
+    return Flow.from_client_secrets_file(
+        credentials_file(), scopes=SCOPES, redirect_uri=REDIRECT_URI
+    )
+
+
+def authorization_url(flow: Flow) -> str:
+    """Foydalanuvchi ruxsat berishi uchun havola qaytaradi."""
+    url, _ = flow.authorization_url(
+        access_type="offline", prompt="consent", include_granted_scopes="true"
+    )
+    return url
+
+
+def finish_auth(flow: Flow, code: str) -> None:
+    """Foydalanuvchi bergan kodni token'ga almashtirib, saqlaydi."""
+    flow.fetch_token(code=code)
+    save_credentials(flow.credentials)

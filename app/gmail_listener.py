@@ -25,6 +25,7 @@ from app import config, db, gmail_auth
 logger = logging.getLogger(__name__)
 
 OnSms = Callable[[dict], Awaitable[None]]
+OnAuthNeeded = Callable[[str], Awaitable[None]]
 
 
 # ===== Yordamchi parse funksiyalari =====
@@ -162,9 +163,15 @@ def _mark_read(service, mid: str) -> None:
 
 # ===== Asosiy tsikl =====
 
-async def run_gmail_listener(on_sms: OnSms) -> None:
-    """Doimiy ishlaydi: ulanadi, muntazam tekshiradi, xato bo'lsa qayta ulanadi."""
+async def run_gmail_listener(
+    on_sms: OnSms, on_auth_needed: OnAuthNeeded | None = None
+) -> None:
+    """Doimiy ishlaydi: ulanadi, muntazam tekshiradi, xato bo'lsa qayta ulanadi.
+
+    Token yo'q/yaroqsiz bo'lsa, on_auth_needed orqali adminlarga (bir marta) xabar beradi.
+    """
     backoff = 5
+    notified_auth = False
     while True:
         try:
             service = await asyncio.to_thread(gmail_auth.build_service)
@@ -172,6 +179,7 @@ async def run_gmail_listener(on_sms: OnSms) -> None:
                 "Gmail API'ga ulanildi. Har %ss da tekshiriladi.", config.POLL_INTERVAL
             )
             backoff = 5
+            notified_auth = False
             while True:
                 await _poll_once(service, on_sms)
                 await asyncio.sleep(config.POLL_INTERVAL)
@@ -181,6 +189,15 @@ async def run_gmail_listener(on_sms: OnSms) -> None:
             logger.error(
                 "Gmail listener xatosi: %s. %ss dan keyin qayta ulanish...", exc, backoff
             )
+            # Token muammosi bo'lsa, adminlarga bir marta avtorizatsiya so'rovini yuboramiz
+            if on_auth_needed and not notified_auth:
+                token_ok = await asyncio.to_thread(gmail_auth.has_valid_token)
+                if not token_ok:
+                    try:
+                        await on_auth_needed("⚠️ Gmail token yo'q yoki muddati tugagan.")
+                    except Exception as e:
+                        logger.error("on_auth_needed xatosi: %s", e)
+                    notified_auth = True
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 

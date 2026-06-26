@@ -55,12 +55,19 @@ cp .env.example .env
 4. **Credentials → Create Credentials → OAuth client ID → Application type: Desktop app**.
 5. `client_secret_*.json` faylini yuklab, loyiha papkasiga qo'ying
    (yoki `GMAIL_CREDENTIALS_FILE`da yo'lini ko'rsating).
-6. **Bir martalik avtorizatsiya** (brauzer ochiladi):
-   ```bash
-   python -m app.authorize
-   ```
-   Bu `token.json` faylini yaratadi. Serverda bu fayl lokal mashinada yaratilib,
-   serverga ko'chiriladi (pastga qarang).
+6. **Avtorizatsiya** — ikki usuldan biri:
+   - **Telegram orqali (server uchun qulay):** botni ishga tushiring va admin `/start`
+     bossin. Token bo'lmasa, bot avtomatik **avtorizatsiya havolasini** yuboradi. Havolani
+     oching, ruxsat bering, so'ng `http://localhost/?code=...` manzilidagi **code** qiymatini
+     (yoki butun havolani) botga qaytaring. Bot `token.json`ni o'zi saqlaydi.
+   - **Lokal skript orqali:**
+     ```bash
+     python -m app.authorize
+     ```
+     Brauzer ochiladi va `token.json` yaratiladi.
+
+> Token muddati tugasa, bot adminlarga yangi avtorizatsiya havolasini avtomatik yuboradi
+> (yoki menyudagi «🔑 Gmail avtorizatsiya» tugmasini bosing).
 
 > RingCentral tomonida: SMS → email bildirishnoma (notification) yoqilgan bo'lishi va xatlar
 > ushbu Gmail manziliga kelishi kerak.

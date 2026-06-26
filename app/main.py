@@ -4,7 +4,7 @@ import asyncio
 import logging
 
 from app import config, db
-from app.bot import create_bot, forward_sms
+from app.bot import create_bot, forward_sms, request_authorization
 from app.gmail_listener import run_gmail_listener
 
 logging.basicConfig(
@@ -31,12 +31,15 @@ async def main() -> None:
         sent = await forward_sms(sms)
         logger.info("SMS %d ta guruhga uzatildi.", sent)
 
+    async def _on_auth_needed(reason: str) -> None:
+        await request_authorization(list(config.ADMIN_IDS), reason)
+
     polling_task = asyncio.create_task(
         dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types()),
         name="telegram-polling",
     )
     gmail_task = asyncio.create_task(
-        run_gmail_listener(_on_sms),
+        run_gmail_listener(_on_sms, _on_auth_needed),
         name="gmail-listener",
     )
 

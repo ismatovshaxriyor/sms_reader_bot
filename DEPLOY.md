@@ -51,26 +51,29 @@ To'ldiring: `TELEGRAM_BOT_TOKEN`, `ADMIN_IDS`
 > sudo chmod 600 /opt/sms_reader_bot/.env
 > ```
 
-## 5. Gmail OAuth fayllarini ko'chirish
+## 5. Gmail OAuth (`client_secret` va avtorizatsiya)
 
-Server brauzersiz (headless) bo'lgani uchun OAuth avtorizatsiyani **lokal kompyuterda**
-bajaring, so'ng natijani serverga ko'chiring.
-
-Lokal kompyuterda (loyiha papkasida):
+OAuth client faylini (`client_secret_*.json`) serverga ko'chiring:
 ```bash
-python -m app.authorize     # brauzer ochiladi -> token.json yaratiladi
+scp client_secret_*.json USER@SERVER:/opt/sms_reader_bot/
+sudo chown botuser:botuser /opt/sms_reader_bot/client_secret_*.json
+sudo chmod 600 /opt/sms_reader_bot/client_secret_*.json
 ```
 
-Hosil bo'lgan ikkita maxfiy faylni serverga ko'chiring:
-```bash
-scp client_secret_*.json token.json USER@SERVER:/opt/sms_reader_bot/
-```
+So'ng avtorizatsiya — **ikki usuldan biri**:
 
-Serverda ruxsat va egalikni to'g'rilang:
-```bash
-sudo chown botuser:botuser /opt/sms_reader_bot/client_secret_*.json /opt/sms_reader_bot/token.json
-sudo chmod 600 /opt/sms_reader_bot/client_secret_*.json /opt/sms_reader_bot/token.json
-```
+- **Telegram orqali (tavsiya, server uchun qulay):** botni ishga tushiring (6-bo'lim).
+  Token bo'lmagani uchun bot adminlarga avtorizatsiya havolasini yuboradi. Havolani oching,
+  ruxsat bering va `code` qiymatini botga qaytaring — `token.json` serverda o'zi yaratiladi.
+  (Bu holda token.json'ni ko'chirish shart emas.)
+
+- **Lokalda yaratib ko'chirish:** lokal kompyuterda `python -m app.authorize` (brauzer
+  ochiladi) → hosil bo'lgan `token.json`ni serverga ko'chiring:
+  ```bash
+  scp token.json USER@SERVER:/opt/sms_reader_bot/
+  sudo chown botuser:botuser /opt/sms_reader_bot/token.json
+  sudo chmod 600 /opt/sms_reader_bot/token.json
+  ```
 
 Tekshirish (ixtiyoriy — qo'lda bir marta ishga tushirib ko'rish):
 ```bash

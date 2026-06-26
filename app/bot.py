@@ -3,9 +3,12 @@
 Foydalanuvchi faqat /start yuboradi — qolgan barcha amallar tugmalar orqali.
 """
 
+import asyncio
 import logging
+import re
 from datetime import datetime
 from html import escape
+from urllib.parse import parse_qs, unquote, urlparse
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -20,13 +23,17 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from app import config, db
+from app import config, db, gmail_auth
 
 logger = logging.getLogger(__name__)
 router = Router()
 
 # main.py'da create_bot() chaqirilganda o'rnatiladi
 _bot: Bot | None = None
+
+# Telegram orqali OAuth holati
+_pending_flow = None          # joriy avtorizatsiya Flow obyekti
+_awaiting_code: set[int] = set()  # kod kutilayotgan admin ID'lari
 
 
 HELP_TEXT = (
@@ -58,6 +65,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="📋 Guruhlar", callback_data="groups")
     b.button(text="🧪 Test xabar", callback_data="test")
+    b.button(text="🔑 Gmail avtorizatsiya", callback_data="reauth")
     b.button(text="ℹ️ Yordam", callback_data="help")
     b.adjust(1)
     return b.as_markup()
@@ -94,14 +102,22 @@ def confirm_kb(chat_id: int) -> InlineKeyboardMarkup:
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     uid = message.from_user.id if message.from_user else None
-    if uid in config.ADMIN_IDS:
-        await message.answer("🤖 <b>Asosiy menyu</b>\nKerakli amalni tanlang:", reply_markup=main_menu_kb())
-    else:
+    if uid not in config.ADMIN_IDS:
         await message.answer(
             "👋 Salom! Bu bot faqat adminlar uchun ishlaydi.\n"
             f"Sizning Telegram ID: <code>{uid}</code>\n"
             "Admin bo'lish uchun ushbu ID'ni bot egasiga bering."
         )
+        return
+
+    # Gmail token bo'lmasa yoki muddati tugagan bo'lsa — avtorizatsiya so'raymiz
+    if not await asyncio.to_thread(gmail_auth.has_valid_token):
+        await request_authorization([uid], "⚠️ Gmail avtorizatsiya talab qilinadi.")
+        return
+
+    await message.answer(
+        "🤖 <b>Asosiy menyu</b>\nKerakli amalni tanlang:", reply_markup=main_menu_kb()
+    )
 
 
 # ===== Menyu tugmalari (faqat admin) =====
@@ -167,10 +183,54 @@ async def cb_test(cq: CallbackQuery) -> None:
     await cq.answer(f"📤 Test {sent} ta active guruhga yuborildi.", show_alert=True)
 
 
+@router.callback_query(F.data == "reauth", IsAdmin())
+async def cb_reauth(cq: CallbackQuery) -> None:
+    await cq.answer()
+    await request_authorization([cq.from_user.id], "🔑 Gmail qayta avtorizatsiya.")
+
+
 # Boshqa barcha callback'lar (admin bo'lmaganlar yoki eskirgan tugmalar)
 @router.callback_query()
 async def cb_fallback(cq: CallbackQuery) -> None:
     await cq.answer("⛔ Ruxsat yo'q yoki tugma eskirgan.", show_alert=True)
+
+
+# ===== Telegram orqali OAuth: admin kodni shu yerga yuboradi =====
+
+@router.message(IsAdmin(), F.text, F.chat.type == ChatType.PRIVATE)
+async def on_admin_text(message: Message) -> None:
+    uid = message.from_user.id
+    if uid not in _awaiting_code:
+        return  # avtorizatsiya kutilmayotgan bo'lsa, boshqa matnlarni e'tiborsiz qoldiramiz
+
+    code = _extract_code(message.text)
+    if not code:
+        await message.answer(
+            "❌ Kod topilmadi. Havoladagi <code>code</code> qiymatini yoki butun havolani yuboring."
+        )
+        return
+
+    global _pending_flow
+    if _pending_flow is None:
+        _awaiting_code.discard(uid)
+        await message.answer("⚠️ Avtorizatsiya sessiyasi topilmadi. Qaytadan: 🔑 tugmasi yoki /start.")
+        return
+
+    try:
+        await asyncio.to_thread(gmail_auth.finish_auth, _pending_flow, code)
+    except Exception as exc:
+        await message.answer(
+            f"❌ Avtorizatsiya xatosi: {escape(str(exc))}\n"
+            "Qaytadan urinib ko'ring (🔑 tugmasi yoki /start)."
+        )
+        return
+
+    _awaiting_code.clear()
+    _pending_flow = None
+    await message.answer(
+        "✅ Gmail avtorizatsiya muvaffaqiyatli! Endi bot xatlarni o'qiy oladi.",
+        reply_markup=main_menu_kb(),
+    )
 
 
 # ===== Botning guruhga qo'shilishini avtomatik aniqlash =====
@@ -223,6 +283,63 @@ async def _notify_admins(text: str, kb: InlineKeyboardMarkup | None = None) -> N
             await _bot.send_message(admin_id, text, reply_markup=kb)
         except Exception:
             pass  # admin botni shaxsiy chatda ishga tushirmagan bo'lishi mumkin
+
+
+def _extract_code(text: str) -> str | None:
+    """Admin yuborgan matndan OAuth kodini ajratadi (kod yoki to'liq havola)."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    if "code=" in text:
+        try:
+            qs = parse_qs(urlparse(text).query)
+            if qs.get("code"):
+                return qs["code"][0]
+        except Exception:
+            pass
+        m = re.search(r"code=([^&\s]+)", text)
+        if m:
+            return unquote(m.group(1))
+    return text
+
+
+async def request_authorization(admin_ids, reason: str = "") -> None:
+    """Gmail OAuth havolasini yaratib, adminlarga yuboradi va kod kutadi."""
+    global _pending_flow
+    if _bot is None:
+        return
+    try:
+        flow = await asyncio.to_thread(gmail_auth.create_auth_flow)
+        url = gmail_auth.authorization_url(flow)
+    except Exception as exc:
+        logger.error("Avtorizatsiya havolasini yaratib bo'lmadi: %s", exc)
+        for aid in admin_ids:
+            try:
+                await _bot.send_message(
+                    aid,
+                    f"❌ Avtorizatsiya havolasini yaratib bo'lmadi: {escape(str(exc))}\n"
+                    "client_secret_*.json fayli loyiha papkasida bormi?",
+                )
+            except Exception:
+                pass
+        return
+
+    _pending_flow = flow
+    text = (
+        (f"{reason}\n\n" if reason else "")
+        + "🔑 <b>Gmail avtorizatsiya</b>\n\n"
+        "1️⃣ Havolani oching, Google hisobingizga kirib <b>ruxsat bering</b>:\n"
+        f"{escape(url)}\n\n"
+        "2️⃣ Ruxsatdan so'ng brauzer <code>http://localhost/?code=...</code> manziliga o'tadi "
+        "(sahifa ochilmasligi normal).\n"
+        "3️⃣ O'sha manzildagi <b>code</b> qiymatini (yoki butun havolani) shu chatga yuboring."
+    )
+    for aid in admin_ids:
+        _awaiting_code.add(aid)
+        try:
+            await _bot.send_message(aid, text, disable_web_page_preview=True)
+        except Exception:
+            pass
 
 
 def _groups_text(rows) -> str:
