@@ -278,20 +278,31 @@ async def on_my_chat_member(event: ChatMemberUpdated) -> None:
     new_status = event.new_chat_member.status
     actor_id = event.from_user.id if event.from_user else None
 
-    if new_status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR):
-        await db.upsert_pending_group(chat.id, chat.title, chat.username, actor_id)
-        logger.info("Bot added to group: %s (%s), status=%s", chat.title, chat.id, new_status)
-
+    if new_status == ChatMemberStatus.ADMINISTRATOR:
+        # Bot made admin → auto-confirm and auto-select as target
+        await db.set_group_active(chat.id, chat.title, chat.username, actor_id)
+        await db.set_target_group(chat.id)
+        logger.info(
+            "Bot added as admin: %s (%s) — auto-selected as target",
+            chat.title, chat.id,
+        )
         title = escape(chat.title or "—")
-        if new_status == ChatMemberStatus.ADMINISTRATOR:
-            text = f"➕ Bot added as admin to: <b>{title}</b>\nWould you like to confirm this group?"
-            await _notify_admins(text, confirm_kb(chat.id))
-        else:
-            text = (
-                f"➕ Bot added to group: <b>{title}</b>\n"
-                "⚠️ The bot is not an admin yet. Make it an admin first, then confirm via «📋 Groups» menu."
-            )
-            await _notify_admins(text)
+        text = (
+            f"✅ Bot added as admin to: <b>{title}</b>\n"
+            "📌 Automatically selected as the forwarding target.\n"
+            "All SMS messages will now be forwarded to this group."
+        )
+        await _notify_admins(text)
+
+    elif new_status == ChatMemberStatus.MEMBER:
+        await db.upsert_pending_group(chat.id, chat.title, chat.username, actor_id)
+        logger.info("Bot added to group: %s (%s) as member", chat.title, chat.id)
+        title = escape(chat.title or "—")
+        text = (
+            f"➕ Bot added to group: <b>{title}</b>\n"
+            "⚠️ Make the bot an <b>admin</b> — it will be auto-confirmed and selected."
+        )
+        await _notify_admins(text)
 
     elif new_status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED):
         await db.set_group_status(chat.id, "removed")
