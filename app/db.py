@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS groups (
     username    TEXT,
     status      TEXT    NOT NULL DEFAULT 'active',   -- 'active' | 'pending' | 'removed'
     added_by    INTEGER,
+    is_target   INTEGER NOT NULL DEFAULT 0,           -- 1 = forwarding target (only one)
     created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -40,6 +41,13 @@ async def init_db() -> None:
     _db = await aiosqlite.connect(config.DATABASE_PATH)
     _db.row_factory = aiosqlite.Row
     await _db.executescript(_SCHEMA)
+    # Migration: add is_target column for existing databases
+    try:
+        await _db.execute(
+            "ALTER TABLE groups ADD COLUMN is_target INTEGER NOT NULL DEFAULT 0"
+        )
+    except Exception:
+        pass  # Column already exists
     await _db.commit()
 
 
@@ -93,7 +101,11 @@ async def upsert_pending_group(
 
 
 async def set_group_status(chat_id: int, status: str) -> bool:
-    """Changes the group status. Returns True if the group was found."""
+    """Changes the group status. Clears target if not 'active'. Returns True if found."""
+    if status != "active":
+        await _conn().execute(
+            "UPDATE groups SET is_target = 0 WHERE chat_id = ?", (chat_id,)
+        )
     cur = await _conn().execute(
         "UPDATE groups SET status = ? WHERE chat_id = ?", (status, chat_id)
     )
@@ -115,10 +127,29 @@ async def list_groups(statuses: list[str] | None = None) -> list[aiosqlite.Row]:
 
 
 async def get_active_chat_ids() -> list[int]:
-    """Returns the chat_ids of all 'active' groups that SMS messages are forwarded to."""
+    """Returns chat_ids of all 'active' groups."""
     cur = await _conn().execute("SELECT chat_id FROM groups WHERE status = 'active'")
     rows = await cur.fetchall()
     return [row["chat_id"] for row in rows]
+
+
+async def set_target_group(chat_id: int) -> None:
+    """Sets this group as the sole forwarding target (clears all others)."""
+    await _conn().execute("UPDATE groups SET is_target = 0")
+    await _conn().execute(
+        "UPDATE groups SET is_target = 1 WHERE chat_id = ? AND status = 'active'",
+        (chat_id,),
+    )
+    await _conn().commit()
+
+
+async def get_target_chat_id() -> int | None:
+    """Returns the forwarding target group's chat_id, or None if not set."""
+    cur = await _conn().execute(
+        "SELECT chat_id FROM groups WHERE is_target = 1 AND status = 'active'"
+    )
+    row = await cur.fetchone()
+    return row["chat_id"] if row else None
 
 
 async def find_group_by_username(username: str) -> aiosqlite.Row | None:

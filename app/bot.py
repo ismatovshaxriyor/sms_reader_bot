@@ -39,11 +39,12 @@ _awaiting_code: set[int] = set()  # admin IDs awaiting authorization code
 
 HELP_TEXT = (
     "🤖 <b>RingCentral → Telegram SMS bot</b>\n\n"
-    "Forwards SMS messages received on your RingCentral number to confirmed groups.\n\n"
-    "<b>Adding a group:</b>\n"
+    "Forwards SMS messages received on your RingCentral number to the selected group.\n\n"
+    "<b>Setting up:</b>\n"
     "1️⃣ Add the bot to a group and make it an <b>admin</b>.\n"
-    "2️⃣ The bot will send you a «✅ Confirm» button (or confirm via «📋 Groups» menu).\n"
-    "3️⃣ Once confirmed, incoming SMS messages will be forwarded to that group.\n\n"
+    "2️⃣ Confirm the group via «✅ Confirm» button.\n"
+    "3️⃣ Select it as the forwarding target via «📌 Select».\n"
+    "4️⃣ All incoming SMS messages will be forwarded to that group.\n\n"
     "All actions are performed using the buttons below."
 )
 
@@ -85,6 +86,8 @@ def groups_kb(rows) -> InlineKeyboardMarkup:
         if row["status"] == "pending":
             b.button(text=f"✅ Confirm: {title}", callback_data=f"confirm:{row['chat_id']}")
         elif row["status"] == "active":
+            if not row["is_target"]:
+                b.button(text=f"📌 Select: {title}", callback_data=f"select:{row['chat_id']}")
             b.button(text=f"🗑 Remove: {title}", callback_data=f"remove:{row['chat_id']}")
     b.button(text="🔄 Refresh", callback_data="groups")
     b.button(text="⬅️ Back", callback_data="menu")
@@ -158,7 +161,15 @@ async def cb_confirm(cq: CallbackQuery) -> None:
         return
 
     await db.set_group_active(chat.id, chat.title, chat.username, cq.from_user.id)
-    await cq.answer("✅ Confirmed")
+
+    # Auto-select as target if no other target exists
+    existing_target = await db.get_target_chat_id()
+    if existing_target is None:
+        await db.set_target_group(chat.id)
+        await cq.answer("✅ Confirmed and selected as forwarding target")
+    else:
+        await cq.answer("✅ Confirmed")
+
     rows = await db.list_groups(["active", "pending"])
     await _safe_edit(cq.message, _groups_text(rows), groups_kb(rows))
 
@@ -172,6 +183,25 @@ async def cb_remove(cq: CallbackQuery) -> None:
     await _safe_edit(cq.message, _groups_text(rows), groups_kb(rows))
 
 
+@router.callback_query(F.data.startswith("select:"), IsAdmin())
+async def cb_select(cq: CallbackQuery) -> None:
+    chat_id = int(cq.data.split(":", 1)[1])
+    try:
+        me = await cq.bot.get_me()
+        member = await cq.bot.get_chat_member(chat_id, me.id)
+    except Exception as exc:
+        await cq.answer(f"❌ Error: {exc}", show_alert=True)
+        return
+    if member.status != ChatMemberStatus.ADMINISTRATOR:
+        await cq.answer("⚠️ The bot is not an admin in this group.", show_alert=True)
+        return
+
+    await db.set_target_group(chat_id)
+    await cq.answer("📌 Selected as forwarding target")
+    rows = await db.list_groups(["active", "pending"])
+    await _safe_edit(cq.message, _groups_text(rows), groups_kb(rows))
+
+
 @router.callback_query(F.data == "test", IsAdmin())
 async def cb_test(cq: CallbackQuery) -> None:
     sms = {
@@ -181,7 +211,10 @@ async def cb_test(cq: CallbackQuery) -> None:
         "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
     sent = await forward_sms(sms)
-    await cq.answer(f"📤 Test sent to {sent} active group(s).", show_alert=True)
+    if sent:
+        await cq.answer("📤 Test sent to the target group.", show_alert=True)
+    else:
+        await cq.answer("⚠️ No target group selected. Select one in 📋 Groups.", show_alert=True)
 
 
 @router.callback_query(F.data == "reauth", IsAdmin())
@@ -347,16 +380,24 @@ def _groups_text(rows) -> str:
     if not rows:
         return (
             "📭 No groups yet.\n\n"
-            "Add the bot to a group and make it an <b>admin</b> — the group will appear here, "
-            "then press the «✅ Confirm» button."
+            "Add the bot to a group and make it an <b>admin</b> — "
+            "the group will appear here."
         )
     lines = ["<b>📋 Groups</b>\n"]
     for row in rows:
-        emoji = "✅" if row["status"] == "active" else "🕓"
+        if row["status"] == "active" and row["is_target"]:
+            emoji = "📌"
+            status_text = "selected"
+        elif row["status"] == "active":
+            emoji = "✅"
+            status_text = "active"
+        else:
+            emoji = "🕓"
+            status_text = "pending"
         uname = f" (@{row['username']})" if row["username"] else ""
         title = escape(row["title"] or "—")
-        lines.append(f"{emoji} {title}{uname} — <i>{row['status']}</i>")
-    lines.append("\n🕓 = not confirmed. Use buttons to confirm or remove.")
+        lines.append(f"{emoji} {title}{uname} — <i>{status_text}</i>")
+    lines.append("\n📌 = forwarding target\n🕓 = not confirmed")
     return "\n".join(lines)
 
 
@@ -396,47 +437,51 @@ def _format_sms(sms: dict) -> str:
 
 
 async def forward_sms(sms: dict) -> int:
-    """Forwards an SMS to all 'active' groups.
+    """Forwards an SMS to the selected target group.
 
-    If there are no confirmed active groups, the SMS is sent to
-    the admins' private chats as a fallback (so nothing is lost).
+    If no target group is selected, the SMS is sent to the admins'
+    private chats as a fallback (so nothing is lost).
     Returns the number of chats the message was sent to.
     """
     if _bot is None:
         raise RuntimeError("Bot not created. Call create_bot() first.")
 
-    chat_ids = await db.get_active_chat_ids()
-    fallback = False
-    if not chat_ids:
-        chat_ids = list(config.ADMIN_IDS)
-        fallback = True
-        if not chat_ids:
-            logger.warning("No active groups or admins — SMS not forwarded.")
-            return 0
-        logger.info("No active groups — sending SMS to admins.")
-
+    target_id = await db.get_target_chat_id()
     text = _format_sms(sms)
-    if fallback:
-        text = (
-            "⚠️ <i>No confirmed groups yet — SMS sent here instead.</i>\n\n"
-            + text
-        )
-
     attachments = sms.get("attachments") or []
 
-    sent = 0
-    for chat_id in chat_ids:
-        try:
-            await _bot.send_message(chat_id, text)
-            for fname, ctype, data in attachments:
-                await _send_attachment(chat_id, fname, ctype, data)
-            sent += 1
-        except Exception as exc:
-            logger.error("Failed to send (%s): %s", chat_id, exc)
-            # Only change status for actual groups (not admin IDs)
-            if not fallback:
-                await db.set_group_status(chat_id, "removed")
-    return sent
+    # No target group — fallback to admin private chats
+    if target_id is None:
+        admin_ids = list(config.ADMIN_IDS)
+        if not admin_ids:
+            logger.warning("No target group or admins — SMS not forwarded.")
+            return 0
+        logger.info("No target group selected — sending SMS to admins.")
+        fallback_text = (
+            "⚠️ <i>No target group selected — SMS sent here instead.\n"
+            "Use 📋 Groups → 📌 Select to choose a forwarding target.</i>\n\n"
+            + text
+        )
+        sent = 0
+        for admin_id in admin_ids:
+            try:
+                await _bot.send_message(admin_id, fallback_text)
+                for fname, ctype, data in attachments:
+                    await _send_attachment(admin_id, fname, ctype, data)
+                sent += 1
+            except Exception as exc:
+                logger.error("Failed to send to admin (%s): %s", admin_id, exc)
+        return sent
+
+    # Send to the target group
+    try:
+        await _bot.send_message(target_id, text)
+        for fname, ctype, data in attachments:
+            await _send_attachment(target_id, fname, ctype, data)
+        return 1
+    except Exception as exc:
+        logger.error("Failed to send to target group (%s): %s", target_id, exc)
+        return 0
 
 
 async def _send_attachment(chat_id: int, filename: str, ctype: str, data: bytes) -> None:
