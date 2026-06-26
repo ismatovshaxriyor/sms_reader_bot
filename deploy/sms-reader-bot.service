@@ -1,0 +1,32 @@
+[Unit]
+Description=RingCentral SMS (Gmail) -> Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Botni ishga tushiradigan foydalanuvchi (root EMAS, masalan: botuser)
+User=botuser
+Group=botuser
+
+# Loyiha joylashgan papka (.env shu yerda bo'lishi shart)
+WorkingDirectory=/opt/sms_reader_bot
+
+# venv ichidagi python bilan ishga tushirish
+ExecStart=/opt/sms_reader_bot/venv/bin/python -m app.main
+
+# Yiqilsa avtomatik qayta ishga tushirish
+Restart=always
+RestartSec=5
+
+# Loglar journald'ga yoziladi (journalctl bilan ko'riladi)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sms-reader-bot
+
+# Xavfsizlik (ixtiyoriy, lekin tavsiya etiladi)
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
