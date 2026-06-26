@@ -292,12 +292,21 @@ async def run_gmail_listener(
     """
     backoff = 5
     notified_auth = False
+    is_first_start = True
     while True:
         try:
             service = await asyncio.to_thread(gmail_auth.build_service)
             logger.info(
                 "Connected to Gmail API. Polling every %ss.", config.POLL_INTERVAL
             )
+            
+            if is_first_start:
+                try:
+                    await _send_startup_test_messages(service, on_sms)
+                except Exception as e:
+                    logger.error("Failed to send startup test messages: %s", e)
+                is_first_start = False
+                
             backoff = 5
             notified_auth = False
             while True:
@@ -377,3 +386,50 @@ async def _poll_once(service, on_sms: OnSms) -> None:
             logger.error("Forwarding error: %s", exc)
 
         await asyncio.to_thread(_mark_read, service, mid)
+
+
+async def _send_startup_test_messages(service, on_sms: OnSms) -> None:
+    """Fetches the 3 most recent VALID messages and sends them on startup for testing."""
+    logger.info("Fetching the latest 3 matching messages for startup test...")
+    # Fetch without 'is:unread' to get the absolute latest ones
+    query = config.GMAIL_QUERY.replace("is:unread", "").strip()
+    resp = await asyncio.to_thread(
+        lambda: service.users().messages().list(userId="me", q=query, maxResults=20).execute()
+    )
+    
+    valid_count = 0
+    for item in resp.get("messages", []):
+        if valid_count >= 3:
+            break
+            
+        mid = item["id"]
+        full = await asyncio.to_thread(
+            lambda: service.users().messages().get(userId="me", id=mid, format="raw").execute()
+        )
+        raw = base64.urlsafe_b64decode(full["raw"].encode("utf-8"))
+        parsed = parse_message(raw)
+        
+        if not parsed["is_ringcentral"]:
+            continue
+        if config.SKIP_NUMBERS and config.normalize_number(parsed["from_number"]) in config.SKIP_NUMBERS:
+            continue
+        if parsed["kind"] == "voice" and parsed["text"].lower() in ("unavailable", ""):
+            continue
+            
+        attachments = extract_attachments(raw)
+        sms = {
+            "kind": parsed["kind"],
+            "from_number": parsed["from_number"],
+            "to_name": parsed["to_name"],
+            "time": parsed["time"],
+            "length": parsed["length"],
+            "text": parsed["text"],
+            "attachments": attachments,
+        }
+        
+        logger.info("Startup Test Sending -> %s: %s", parsed["kind"], parsed["from_number"])
+        try:
+            await on_sms(sms)
+            valid_count += 1
+        except Exception as exc:
+            logger.error("Startup test forwarding error: %s", exc)
