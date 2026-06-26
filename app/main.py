@@ -1,4 +1,4 @@
-"""Kirish nuqtasi: Telegram botni va RingCentral tinglovchisini parallel ishga tushiradi."""
+"""Entry point: starts the Telegram bot and RingCentral listener in parallel."""
 
 import asyncio
 import logging
@@ -16,20 +16,20 @@ logger = logging.getLogger("sms_reader_bot")
 
 async def main() -> None:
     await db.init_db()
-    logger.info("Ma'lumotlar bazasi tayyor: %s", config.DATABASE_PATH)
+    logger.info("Database ready: %s", config.DATABASE_PATH)
 
     if not config.ADMIN_IDS:
         logger.warning(
-            "ADMIN_IDS bo'sh! Bot komandalariga hech kim kira olmaydi. .env'ni to'ldiring."
+            "ADMIN_IDS is empty! No one can access bot commands. Fill in .env."
         )
 
     bot, dp = create_bot()
     me = await bot.get_me()
-    logger.info("Telegram bot ishga tushdi: @%s", me.username)
+    logger.info("Telegram bot started: @%s", me.username)
 
     async def _on_sms(sms: dict) -> None:
         sent = await forward_sms(sms)
-        logger.info("SMS %d ta guruhga uzatildi.", sent)
+        logger.info("SMS forwarded to %d group(s).", sent)
 
     async def _on_auth_needed(reason: str) -> None:
         await request_authorization(list(config.ADMIN_IDS), reason)
@@ -56,4 +56,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logging.getLogger("sms_reader_bot").info("To'xtatildi.")
+        logging.getLogger("sms_reader_bot").info("Stopped.")

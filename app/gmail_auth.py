@@ -1,7 +1,7 @@
-"""Gmail API OAuth hisob ma'lumotlari bilan ishlash.
+"""Working with Gmail API OAuth credentials.
 
-Bu modul config'ga bog'liq emas (Telegram sozlamalarisiz ham ishlaydi),
-shuning uchun avtorizatsiya skripti (app/authorize.py) ham undan foydalanadi.
+This module does not depend on config (works without Telegram settings),
+so the authorization script (app/authorize.py) also uses it.
 """
 
 import glob
@@ -15,21 +15,21 @@ from googleapiclient.discovery import build
 
 load_dotenv()
 
-# Xatlarni o'qish va "o'qilgan" deb belgilash uchun gmail.modify kerak
+# gmail.modify is needed to read messages and mark them as "read"
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 
 TOKEN_FILE = (os.environ.get("GMAIL_TOKEN_FILE") or "token.json").strip()
 
-# Brauzersiz (Telegram orqali) avtorizatsiya uchun loopback redirect.
-# Foydalanuvchi ruxsat bergach, brauzer http://localhost/?code=... ga o'tadi
-# (sahifa ochilmaydi) va kod o'sha manzildan olinadi.
+# Loopback redirect for browserless (via Telegram) authorization.
+# After the user grants permission, the browser redirects to http://localhost/?code=...
+# (the page won't open) and the code is extracted from that URL.
 REDIRECT_URI = "http://localhost"
 
 
 def credentials_file() -> str:
-    """OAuth client (client_secret) faylini topadi.
+    """Finds the OAuth client (client_secret) file.
 
-    Tartib: GMAIL_CREDENTIALS_FILE env -> credentials.json -> client_secret*.json
+    Order: GMAIL_CREDENTIALS_FILE env -> credentials.json -> client_secret*.json
     """
     explicit = (os.environ.get("GMAIL_CREDENTIALS_FILE") or "").strip()
     if explicit:
@@ -46,11 +46,11 @@ def save_credentials(creds: Credentials) -> None:
 
 
 def load_credentials() -> Credentials:
-    """token.json'dan credential yuklaydi, kerak bo'lsa yangilaydi."""
+    """Loads credentials from token.json, refreshing if needed."""
     if not os.path.exists(TOKEN_FILE):
         raise RuntimeError(
-            f"Gmail token topilmadi: {TOKEN_FILE}. "
-            "Avval avtorizatsiya qiling:  python -m app.authorize"
+            f"Gmail token not found: {TOKEN_FILE}. "
+            "Please authorize first:  python -m app.authorize"
         )
     creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
     if creds.valid:
@@ -60,18 +60,18 @@ def load_credentials() -> Credentials:
         save_credentials(creds)
         return creds
     raise RuntimeError(
-        f"Gmail token yaroqsiz: {TOKEN_FILE}. "
-        "Qayta avtorizatsiya qiling:  python -m app.authorize"
+        f"Gmail token is invalid: {TOKEN_FILE}. "
+        "Please re-authorize:  python -m app.authorize"
     )
 
 
 def build_service():
-    """Gmail API xizmat (service) obyektini qaytaradi."""
+    """Returns a Gmail API service object."""
     return build("gmail", "v1", credentials=load_credentials(), cache_discovery=False)
 
 
 def has_valid_token() -> bool:
-    """token.json mavjud va yaroqli (yoki yangilab bo'ladigan) bo'lsa True."""
+    """Returns True if token.json exists and is valid (or can be refreshed)."""
     if not os.path.exists(TOKEN_FILE):
         return False
     try:
@@ -90,17 +90,17 @@ def has_valid_token() -> bool:
     return False
 
 
-# ===== Telegram orqali OAuth (brauzersiz server uchun) =====
+# ===== OAuth via Telegram (for browserless server) =====
 
 def create_auth_flow() -> Flow:
-    """OAuth Flow yaratadi (loopback redirect bilan)."""
+    """Creates an OAuth Flow (with loopback redirect)."""
     return Flow.from_client_secrets_file(
         credentials_file(), scopes=SCOPES, redirect_uri=REDIRECT_URI
     )
 
 
 def authorization_url(flow: Flow) -> str:
-    """Foydalanuvchi ruxsat berishi uchun havola qaytaradi."""
+    """Returns a URL for the user to grant permission."""
     url, _ = flow.authorization_url(
         access_type="offline", prompt="consent", include_granted_scopes="true"
     )
@@ -108,6 +108,6 @@ def authorization_url(flow: Flow) -> str:
 
 
 def finish_auth(flow: Flow, code: str) -> None:
-    """Foydalanuvchi bergan kodni token'ga almashtirib, saqlaydi."""
+    """Exchanges the user-provided code for a token and saves it."""
     flow.fetch_token(code=code)
     save_credentials(flow.credentials)

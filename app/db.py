@@ -1,7 +1,7 @@
-"""SQLite (aiosqlite) ma'lumotlar bazasi: guruhlar va dedup jadvallari.
+"""SQLite (aiosqlite) database: groups and dedup tables.
 
-Bitta umumiy ulanish ishlatiladi — aiosqlite barcha so'rovlarni o'z navbatida
-ketma-ket bajaradi, shuning uchun bir nechta coroutine'dan foydalanish xavfsiz.
+A single shared connection is used — aiosqlite executes all queries
+sequentially in its own queue, so it is safe to use from multiple coroutines.
 """
 
 import aiosqlite
@@ -30,12 +30,12 @@ CREATE TABLE IF NOT EXISTS processed_messages (
 
 def _conn() -> aiosqlite.Connection:
     if _db is None:
-        raise RuntimeError("DB ishga tushirilmagan. Avval init_db() chaqiring.")
+        raise RuntimeError("DB is not initialized. Call init_db() first.")
     return _db
 
 
 async def init_db() -> None:
-    """Bazaga ulanadi va jadvallarni yaratadi (agar yo'q bo'lsa)."""
+    """Connects to the database and creates tables (if they don't exist)."""
     global _db
     _db = await aiosqlite.connect(config.DATABASE_PATH)
     _db.row_factory = aiosqlite.Row
@@ -50,12 +50,12 @@ async def close() -> None:
         _db = None
 
 
-# ===== Guruhlar =====
+# ===== Groups =====
 
 async def set_group_active(
     chat_id: int, title: str | None, username: str | None, added_by: int | None
 ) -> None:
-    """Guruhni 'active' holatda saqlaydi (mavjud bo'lsa yangilaydi)."""
+    """Saves the group in 'active' status (updates if it already exists)."""
     await _conn().execute(
         """
         INSERT INTO groups (chat_id, title, username, status, added_by)
@@ -74,10 +74,10 @@ async def set_group_active(
 async def upsert_pending_group(
     chat_id: int, title: str | None, username: str | None, added_by: int | None
 ) -> None:
-    """Bot guruhga qo'shilganda 'pending' holatda yozadi.
+    """Records the group in 'pending' status when the bot is added to it.
 
-    Agar guruh allaqachon mavjud bo'lsa, faqat sarlavha/username yangilanadi —
-    'active' holati saqlanib qoladi.
+    If the group already exists, only the title/username are updated —
+    the 'active' status is preserved.
     """
     await _conn().execute(
         """
@@ -93,7 +93,7 @@ async def upsert_pending_group(
 
 
 async def set_group_status(chat_id: int, status: str) -> bool:
-    """Guruh holatini o'zgartiradi. Topilsa True qaytaradi."""
+    """Changes the group status. Returns True if the group was found."""
     cur = await _conn().execute(
         "UPDATE groups SET status = ? WHERE chat_id = ?", (status, chat_id)
     )
@@ -102,7 +102,7 @@ async def set_group_status(chat_id: int, status: str) -> bool:
 
 
 async def list_groups(statuses: list[str] | None = None) -> list[aiosqlite.Row]:
-    """Guruhlarni qaytaradi (ixtiyoriy holat bo'yicha filtrlangan)."""
+    """Returns groups (optionally filtered by status)."""
     if statuses:
         placeholders = ",".join("?" * len(statuses))
         cur = await _conn().execute(
@@ -115,14 +115,14 @@ async def list_groups(statuses: list[str] | None = None) -> list[aiosqlite.Row]:
 
 
 async def get_active_chat_ids() -> list[int]:
-    """SMS uzatiladigan barcha 'active' guruhlar chat_id'larini qaytaradi."""
+    """Returns the chat_ids of all 'active' groups that SMS messages are forwarded to."""
     cur = await _conn().execute("SELECT chat_id FROM groups WHERE status = 'active'")
     rows = await cur.fetchall()
     return [row["chat_id"] for row in rows]
 
 
 async def find_group_by_username(username: str) -> aiosqlite.Row | None:
-    """@username bo'yicha guruhni topadi."""
+    """Finds a group by its @username."""
     uname = username.lstrip("@").lower()
     cur = await _conn().execute(
         "SELECT * FROM groups WHERE lower(username) = ?", (uname,)
@@ -130,7 +130,7 @@ async def find_group_by_username(username: str) -> aiosqlite.Row | None:
     return await cur.fetchone()
 
 
-# ===== Dedup (takror SMS'larni oldini olish) =====
+# ===== Dedup (prevent duplicate SMS forwarding) =====
 
 async def is_processed(message_id: str) -> bool:
     cur = await _conn().execute(

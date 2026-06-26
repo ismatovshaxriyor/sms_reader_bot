@@ -1,12 +1,12 @@
-"""Gmail API tinglovchisi: RingCentral SMS / ovozli xabar bildirishnomalarini o'qiydi.
+"""Gmail API listener: reads RingCentral SMS / voicemail notifications.
 
-RingCentral xatlari (to'g'ridan-to'g'ri yoki forward qilingan) Gmail'ga keladi.
-Bu modul Gmail API orqali pochta qutisini muntazam tekshiradi, har bir xatni parse
-qilib, kerakli ma'lumotlarni (matn, vaqt, raqam) va biriktirmalarni (rasm / audio /
-hujjat) ajratadi va Telegram'ga uzatish uchun on_sms'ga beradi.
+RingCentral emails (direct or forwarded) arrive in Gmail.
+This module periodically checks the mailbox via the Gmail API, parses each
+message to extract relevant data (text, time, number) and attachments
+(image / audio / document), then passes them to on_sms for forwarding to Telegram.
 
-Gmail API mijozi bloklovchi (sync) bo'lgani uchun tarmoq amallari asyncio.to_thread
-orqali alohida ipda bajariladi.
+Since the Gmail API client is blocking (sync), network operations are run
+in a separate thread via asyncio.to_thread.
 """
 
 import asyncio
@@ -30,7 +30,7 @@ OnSms = Callable[[dict], Awaitable[None]]
 OnAuthNeeded = Callable[[str], Awaitable[None]]
 
 
-# ===== Matn ajratish yordamchilari =====
+# ===== Text extraction helpers =====
 
 def _decode(value: str | None) -> str:
     if not value:
@@ -57,7 +57,7 @@ def _html_to_text(html: str) -> str:
 
 
 def _get_text(msg: Message) -> str:
-    """Xatdan matnni oladi: avval text/plain (yulduzchali format), bo'lmasa HTML."""
+    """Extracts text from the email: first text/plain (asterisk format), otherwise HTML."""
     plain = None
     html = None
     if msg.is_multipart():
@@ -93,11 +93,18 @@ _SUBJECT_RE = re.compile(
     re.IGNORECASE,
 )
 
-# RingCentral matnida maydonlar yulduzcha bilan: "*From:*", "*Message:*", ...
-# (forward konvertidagi oddiy "Date:/To:/Subject:" bilan adashmaslik uchun)
+# Fields in RingCentral body text marked with asterisks: "*From:*", "*Message:*", ...
+# (to avoid confusion with plain "Date:/To:/Subject:" in the forward envelope)
 _AST_LABEL_RE = re.compile(r"\*\s*([A-Za-z][A-Za-z ]*?)\s*:\s*\*")
 
-# SMS/preview matnidan keyingi keraksiz qism
+# Fallback: text extracted from HTML may not have asterisks.
+# We only search for known RingCentral labels (to prevent false matches).
+_PLAIN_LABEL_RE = re.compile(
+    r"\b(From|To|Received|Message|Voicemail Preview|Length)\s*:\s*",
+    re.IGNORECASE,
+)
+
+# Boilerplate text following the SMS/preview content
 _BOILERPLATE_RE = re.compile(
     r"\s*(?:To reply using"
     r"|To listen to this message"
@@ -113,9 +120,18 @@ _BOILERPLATE_RE = re.compile(
 
 
 def _parse_ast_fields(text: str) -> dict[str, str]:
-    """\"*Label:* value\" ko'rinishidagi maydonlarni ajratadi."""
+    """Extracts fields in \"*Label:* value\" or plain \"Label: value\" format.
+
+    First tries the asterisk format. If not found, falls back to plain format
+    with known label names (for text extracted from HTML).
+    """
     fields: dict[str, str] = {}
     matches = list(_AST_LABEL_RE.finditer(text))
+
+    # No asterisk labels found — fall back to plain label format
+    if not matches:
+        matches = list(_PLAIN_LABEL_RE.finditer(text))
+
     for i, mt in enumerate(matches):
         label = mt.group(1).strip().lower()
         start = mt.end()
@@ -127,12 +143,12 @@ def _parse_ast_fields(text: str) -> dict[str, str]:
 
 
 def parse_message(raw: bytes) -> dict:
-    """Xom (RFC822) xatni parse qilib, xabar maydonlarini qaytaradi."""
+    """Parses a raw (RFC822) email and returns the message fields."""
     msg = email.message_from_bytes(raw)
     message_id = (msg.get("Message-ID") or "").strip()
     subject = _decode(msg.get("Subject"))
 
-    # Subject — eng ishonchli manba (kind + from + vaqt)
+    # Subject is the most reliable source (kind + from + time)
     kind = None
     subj_from = subj_time = ""
     sm = _SUBJECT_RE.search(subject)
@@ -152,7 +168,9 @@ def parse_message(raw: bytes) -> dict:
     length = fields.get("length", "")
 
     if kind == "voice":
-        text = fields.get("voicemail preview", "").strip().strip('"').strip()
+        text = fields.get("voicemail preview", "").strip()
+        # Remove plain and smart/curly quotation marks
+        text = text.strip('"').strip('\u201c\u201d\u00ab\u00bb').strip()
     else:
         text = fields.get("message", "")
 
@@ -170,9 +188,9 @@ def parse_message(raw: bytes) -> dict:
 
 
 def extract_attachments(raw: bytes) -> list[tuple[str, str, bytes]]:
-    """Haqiqiy biriktirmalarni (filename, content_type, bytes) ajratadi.
+    """Extracts actual attachments (filename, content_type, bytes).
 
-    Inline logolarni (Content-ID'li, attachment bo'lmagan) o'tkazib yuboradi.
+    Skips inline logos (those with Content-ID but no attachment disposition).
     """
     msg = email.message_from_bytes(raw)
     out: list[tuple[str, str, bytes]] = []
@@ -190,7 +208,7 @@ def extract_attachments(raw: bytes) -> list[tuple[str, str, bytes]]:
         elif filename and not cid:
             pass
         else:
-            continue  # inline (logo/banner) — o'tkazib yuboramiz
+            continue  # inline (logo/banner) — skip
         data = part.get_payload(decode=True)
         if not data:
             continue
@@ -199,22 +217,22 @@ def extract_attachments(raw: bytes) -> list[tuple[str, str, bytes]]:
 
 
 def _dump_debug_email(raw: bytes, subject: str) -> None:
-    """Parse bo'sh chiqqan xatni keyinroq tahlil qilish uchun saqlaydi."""
+    """Saves an email that parsed empty for later analysis."""
     try:
         os.makedirs("debug_emails", exist_ok=True)
         safe = re.sub(r"[^A-Za-z0-9]+", "_", subject or "no_subject")[:50]
         path = os.path.join("debug_emails", f"{safe}_{int(time.time())}.eml")
         with open(path, "wb") as f:
             f.write(raw)
-        logger.warning("Parse bo'sh — xat tahlil uchun saqlandi: %s", path)
+        logger.warning("Parse empty — email saved for analysis: %s", path)
     except Exception as exc:
-        logger.error("debug email saqlashda xato: %s", exc)
+        logger.error("Error saving debug email: %s", exc)
 
 
-# ===== Gmail API (bloklovchi) amallar =====
+# ===== Gmail API (blocking) operations =====
 
 def _fetch_new(service) -> list[tuple[str, bytes]]:
-    """GMAIL_QUERY bo'yicha xatlarni (id, raw) ro'yxatini qaytaradi."""
+    """Returns a list of emails (id, raw) matching GMAIL_QUERY."""
     resp = (
         service.users()
         .messages()
@@ -241,14 +259,14 @@ def _mark_read(service, mid: str) -> None:
     ).execute()
 
 
-# ===== Asosiy tsikl =====
+# ===== Main loop =====
 
 async def run_gmail_listener(
     on_sms: OnSms, on_auth_needed: OnAuthNeeded | None = None
 ) -> None:
-    """Doimiy ishlaydi: ulanadi, muntazam tekshiradi, xato bo'lsa qayta ulanadi.
+    """Runs continuously: connects, polls periodically, reconnects on error.
 
-    Token yo'q/yaroqsiz bo'lsa, on_auth_needed orqali adminlarga (bir marta) xabar beradi.
+    If the token is missing/invalid, notifies admins (once) via on_auth_needed.
     """
     backoff = 5
     notified_auth = False
@@ -256,7 +274,7 @@ async def run_gmail_listener(
         try:
             service = await asyncio.to_thread(gmail_auth.build_service)
             logger.info(
-                "Gmail API'ga ulanildi. Har %ss da tekshiriladi.", config.POLL_INTERVAL
+                "Connected to Gmail API. Polling every %ss.", config.POLL_INTERVAL
             )
             backoff = 5
             notified_auth = False
@@ -267,15 +285,15 @@ async def run_gmail_listener(
             raise
         except Exception as exc:
             logger.error(
-                "Gmail listener xatosi: %s. %ss dan keyin qayta ulanish...", exc, backoff
+                "Gmail listener error: %s. Reconnecting in %ss...", exc, backoff
             )
             if on_auth_needed and not notified_auth:
                 token_ok = await asyncio.to_thread(gmail_auth.has_valid_token)
                 if not token_ok:
                     try:
-                        await on_auth_needed("⚠️ Gmail token yo'q yoki muddati tugagan.")
+                        await on_auth_needed("⚠️ Gmail token is missing or expired.")
                     except Exception as e:
-                        logger.error("on_auth_needed xatosi: %s", e)
+                        logger.error("on_auth_needed error: %s", e)
                     notified_auth = True
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
@@ -286,20 +304,20 @@ async def _poll_once(service, on_sms: OnSms) -> None:
     for mid, raw in items:
         parsed = parse_message(raw)
 
-        # 0) RingCentral xabari bo'lmasa — tegmaymiz (o'qilmagan holatda qoldiramiz)
+        # 0) Not a RingCentral message — leave untouched (keep unread)
         if not parsed["is_ringcentral"]:
             continue
 
-        # 1) Skip ro'yxatidagi raqamlar
+        # 1) Numbers in the skip list
         if (
             config.SKIP_NUMBERS
             and config.normalize_number(parsed["from_number"]) in config.SKIP_NUMBERS
         ):
-            logger.info("O'tkazib yuborildi (skip raqam): %s", parsed["from_number"])
+            logger.info("Skipped (skip number): %s", parsed["from_number"])
             await asyncio.to_thread(_mark_read, service, mid)
             continue
 
-        # 2) Dublikat (Gmail xabar ID'si bo'yicha)
+        # 2) Duplicate (by Gmail message ID)
         if await db.is_processed(mid):
             await asyncio.to_thread(_mark_read, service, mid)
             continue
@@ -307,7 +325,7 @@ async def _poll_once(service, on_sms: OnSms) -> None:
 
         attachments = extract_attachments(raw)
 
-        # Matn ham, biriktirma ham yo'q bo'lsa — keyinroq tahlil uchun saqlaymiz
+        # If both text and attachments are empty — save for later analysis
         if not parsed["text"] and not attachments:
             _dump_debug_email(raw, parsed["subject"])
 
@@ -321,13 +339,13 @@ async def _poll_once(service, on_sms: OnSms) -> None:
             "attachments": attachments,
         }
         logger.info(
-            "Yangi %s: %s → %s | matn=%d belgi, biriktirma=%d",
+            "New %s: %s → %s | text=%d chars, attachments=%d",
             parsed["kind"], parsed["from_number"], parsed["to_name"],
             len(parsed["text"]), len(attachments),
         )
         try:
             await on_sms(sms)
         except Exception as exc:
-            logger.error("Uzatishda xato: %s", exc)
+            logger.error("Forwarding error: %s", exc)
 
         await asyncio.to_thread(_mark_read, service, mid)
