@@ -362,6 +362,13 @@ async def _poll_once(service, on_sms: OnSms) -> None:
 
         attachments = extract_attachments(raw)
 
+        # 4) Skip short messages (< 5 words) if there are no attachments
+        word_count = len(parsed["text"].split())
+        if word_count < 5 and not attachments:
+            logger.info("Skipped (< 5 words, no attachments): %s", parsed["from_number"])
+            await asyncio.to_thread(_mark_read, service, mid)
+            continue
+
         # If both text and attachments are empty — save for later analysis
         if not parsed["text"] and not attachments:
             _dump_debug_email(raw, parsed["subject"])
@@ -417,6 +424,10 @@ async def _send_startup_test_messages(service, on_sms: OnSms) -> None:
             continue
             
         attachments = extract_attachments(raw)
+        word_count = len(parsed["text"].split())
+        if word_count < 5 and not attachments:
+            continue
+
         sms = {
             "kind": parsed["kind"],
             "from_number": parsed["from_number"],
