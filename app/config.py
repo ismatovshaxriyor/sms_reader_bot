@@ -78,5 +78,12 @@ GMAIL_QUERY: str = (
     'OR "New Fax" OR "New MMS") is:unread'
 ).strip()
 
+# ===== MsgPlane (agent tagging) =====
+MSGPLANE_API_KEY: str = (os.environ.get("MSGPLANE_API_KEY") or "").strip()
+MSGPLANE_API_URL: str = (
+    os.environ.get("MSGPLANE_API_URL")
+    or "https://usst.msgplane.com/api/rest/get/user_by_order_number/"
+).strip()
+
 # ===== Database =====
 DATABASE_PATH: str = (os.environ.get("DATABASE_PATH") or "bot.db").strip()

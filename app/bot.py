@@ -24,7 +24,7 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from app import config, db, gmail_auth
+from app import config, db, gmail_auth, msgplane
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -35,6 +35,9 @@ _bot: Bot | None = None
 # Telegram OAuth state
 _pending_flow = None          # current authorization Flow object
 _awaiting_code: set[int] = set()  # admin IDs awaiting authorization code
+
+# Contact add state: user_id -> {"step": 1} or {"step": 2, "msgplane": "Albert"}
+_contact_add_state: dict[int, dict] = {}
 
 
 HELP_TEXT = (
@@ -66,9 +69,24 @@ def _short(title: str | None, limit: int = 24) -> str:
 def main_menu_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="📋 Groups", callback_data="groups")
+    b.button(text="📇 Contacts", callback_data="contacts")
     b.button(text="🧪 Test message", callback_data="test")
     b.button(text="🔑 Gmail authorization", callback_data="reauth")
     b.button(text="ℹ️ Help", callback_data="help")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def contacts_kb(rows) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for row in rows:
+        b.button(
+            text=f"➖ Delete: {row['msgplane_username']}",
+            callback_data=f"del_contact:{row['id']}",
+        )
+    b.button(text="➕ Add contact", callback_data="contact_add")
+    b.button(text="🔄 Refresh", callback_data="contacts")
+    b.button(text="⬅️ Back", callback_data="menu")
     b.adjust(1)
     return b.as_markup()
 
@@ -143,6 +161,30 @@ async def cb_groups(cq: CallbackQuery) -> None:
     rows = await db.list_groups(["active", "pending"])
     await _safe_edit(cq.message, _groups_text(rows), groups_kb(rows))
     await cq.answer()
+
+
+@router.callback_query(F.data == "contacts", IsAdmin())
+async def cb_contacts(cq: CallbackQuery) -> None:
+    rows = await db.list_contacts()
+    await _safe_edit(cq.message, _contacts_text(rows), contacts_kb(rows))
+    await cq.answer()
+
+
+@router.callback_query(F.data == "contact_add", IsAdmin())
+async def cb_contact_add(cq: CallbackQuery) -> None:
+    uid = cq.from_user.id
+    _contact_add_state[uid] = {"step": 1}
+    await cq.answer()
+    await cq.message.answer("Enter the agent's MsgPlane username (e.g. Albert):")
+
+
+@router.callback_query(F.data.startswith("del_contact:"), IsAdmin())
+async def cb_del_contact(cq: CallbackQuery) -> None:
+    contact_id = int(cq.data.split(":", 1)[1])
+    deleted = await db.delete_contact(contact_id)
+    await cq.answer("✅ Deleted" if deleted else "⚠️ Not found")
+    rows = await db.list_contacts()
+    await _safe_edit(cq.message, _contacts_text(rows), contacts_kb(rows))
 
 
 @router.callback_query(F.data.startswith("confirm:"), IsAdmin())
@@ -234,6 +276,11 @@ async def cb_fallback(cq: CallbackQuery) -> None:
 @router.message(IsAdmin(), F.text, F.chat.type == ChatType.PRIVATE)
 async def on_admin_text(message: Message) -> None:
     uid = message.from_user.id
+
+    if uid in _contact_add_state:
+        await _handle_contact_add(message, uid)
+        return
+
     if uid not in _awaiting_code:
         return  # not awaiting authorization, ignore other text
 
@@ -387,6 +434,41 @@ async def request_authorization(admin_ids, reason: str = "") -> None:
             pass
 
 
+async def _handle_contact_add(message: Message, uid: int) -> None:
+    state = _contact_add_state[uid]
+    text = (message.text or "").strip()
+
+    if state["step"] == 1:
+        if not text:
+            await message.answer("Please enter a valid MsgPlane username:")
+            return
+        _contact_add_state[uid] = {"step": 2, "msgplane": text}
+        await message.answer(f"MsgPlane: <b>{escape(text)}</b>\nNow enter the Telegram username (@username):")
+
+    elif state["step"] == 2:
+        tg = text if text.startswith("@") else "@" + text
+        msgplane_name = state["msgplane"]
+        await db.upsert_contact(msgplane_name, tg)
+        del _contact_add_state[uid]
+        await message.answer(
+            f"✅ Saved: <b>{escape(msgplane_name)}</b> → <code>{escape(tg)}</code>",
+            reply_markup=main_menu_kb(),
+        )
+
+
+def _contacts_text(rows) -> str:
+    if not rows:
+        return (
+            "📇 <b>Contacts</b>\n\n"
+            "No contacts yet.\n"
+            "Press <b>➕ Add contact</b> to link a MsgPlane agent to a Telegram username."
+        )
+    lines = [f"📇 <b>Contacts: {len(rows)}</b>\n"]
+    for i, row in enumerate(rows, 1):
+        lines.append(f"{i}. {escape(row['msgplane_username'])} → <code>{escape(row['telegram_username'])}</code>")
+    return "\n".join(lines)
+
+
 def _groups_text(rows) -> str:
     if not rows:
         return (
@@ -412,7 +494,7 @@ def _groups_text(rows) -> str:
     return "\n".join(lines)
 
 
-def _format_sms(sms: dict) -> str:
+def _format_sms(sms: dict, agent_mention: str = "") -> str:
     kind = sms.get("kind") or "sms"
     from_number = sms.get("from_number") or "—"
     to_name = sms.get("to_name") or "—"
@@ -447,7 +529,24 @@ def _format_sms(sms: dict) -> str:
         lines.append("<i>(no text — attachment below)</i>")
     else:
         lines.append("<i>(empty message)</i>")
-    return "\n".join(lines)
+
+    result = "\n".join(lines)
+    if agent_mention:
+        result += f"\n\nAgent: {escape(agent_mention)}"
+    return result
+
+
+async def _resolve_agent_mention(order_id: str | None) -> str:
+    """Returns agent mention string (e.g. '@albert_tg' or 'Albert') for the given order ID."""
+    if not order_id or not config.MSGPLANE_API_KEY:
+        return ""
+    user_name = await msgplane.get_agent_name(
+        config.MSGPLANE_API_KEY, order_id, config.MSGPLANE_API_URL
+    )
+    if not user_name:
+        return ""
+    contact = await db.get_contact_by_msgplane(user_name)
+    return contact["telegram_username"] if contact else user_name
 
 
 async def forward_sms(sms: dict) -> int:
@@ -461,7 +560,8 @@ async def forward_sms(sms: dict) -> int:
         raise RuntimeError("Bot not created. Call create_bot() first.")
 
     target_id = await db.get_target_chat_id()
-    text = _format_sms(sms)
+    agent_mention = await _resolve_agent_mention(sms.get("order_id"))
+    text = _format_sms(sms, agent_mention=agent_mention)
     attachments = sms.get("attachments") or []
 
     # No target group — fallback to admin private chats

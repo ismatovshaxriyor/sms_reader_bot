@@ -104,6 +104,16 @@ _PLAIN_LABEL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Order IDs: 32015499-US or 32015499US (7-9 digits + optional dash + 2 uppercase letters)
+_ORDER_ID_RE = re.compile(r'\b(\d{7,9}-?[A-Z]{2})\b')
+
+
+def parse_order_id(text: str) -> str | None:
+    """Extracts the first order ID from SMS text, e.g. '32015499-US' or '32015499US'."""
+    m = _ORDER_ID_RE.search(text or "")
+    return m.group(1) if m else None
+
+
 # Boilerplate text following the SMS/preview content
 _BOILERPLATE_RE = re.compile(
     r"\s*(?:To reply using"
@@ -381,11 +391,12 @@ async def _poll_once(service, on_sms: OnSms) -> None:
             "length": parsed["length"],
             "text": parsed["text"],
             "attachments": attachments,
+            "order_id": parse_order_id(parsed["text"]),
         }
         logger.info(
-            "New %s: %s → %s | text=%d chars, attachments=%d",
+            "New %s: %s → %s | text=%d chars, attachments=%d, order_id=%s",
             parsed["kind"], parsed["from_number"], parsed["to_name"],
-            len(parsed["text"]), len(attachments),
+            len(parsed["text"]), len(attachments), sms["order_id"],
         )
         try:
             await on_sms(sms)
@@ -436,8 +447,9 @@ async def _send_startup_test_messages(service, on_sms: OnSms) -> None:
             "length": parsed["length"],
             "text": parsed["text"],
             "attachments": attachments,
+            "order_id": parse_order_id(parsed["text"]),
         }
-        
+
         logger.info("Startup Test Sending -> %s: %s", parsed["kind"], parsed["from_number"])
         try:
             await on_sms(sms)

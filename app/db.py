@@ -26,6 +26,13 @@ CREATE TABLE IF NOT EXISTS processed_messages (
     message_id  TEXT PRIMARY KEY,
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS contacts (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    msgplane_username TEXT    NOT NULL UNIQUE,
+    telegram_username TEXT    NOT NULL,
+    created_at        TEXT    NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -176,3 +183,38 @@ async def mark_processed(message_id: str) -> None:
         (str(message_id),),
     )
     await _conn().commit()
+
+
+# ===== Contacts (MsgPlane username → Telegram username) =====
+
+async def list_contacts() -> list[aiosqlite.Row]:
+    cur = await _conn().execute("SELECT * FROM contacts ORDER BY msgplane_username")
+    return list(await cur.fetchall())
+
+
+async def get_contact_by_msgplane(username: str) -> aiosqlite.Row | None:
+    cur = await _conn().execute(
+        "SELECT * FROM contacts WHERE lower(msgplane_username) = lower(?)", (username,)
+    )
+    return await cur.fetchone()
+
+
+async def upsert_contact(msgplane_username: str, telegram_username: str) -> None:
+    tg = telegram_username.strip()
+    if not tg.startswith("@"):
+        tg = "@" + tg
+    await _conn().execute(
+        """
+        INSERT INTO contacts (msgplane_username, telegram_username)
+        VALUES (?, ?)
+        ON CONFLICT(msgplane_username) DO UPDATE SET telegram_username = excluded.telegram_username
+        """,
+        (msgplane_username.strip(), tg),
+    )
+    await _conn().commit()
+
+
+async def delete_contact(contact_id: int) -> bool:
+    cur = await _conn().execute("DELETE FROM contacts WHERE id = ?", (contact_id,))
+    await _conn().commit()
+    return cur.rowcount > 0
